@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: tfms
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - tfms_postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  api:
+    build: ./python-app
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/tfms
+      REDIS_URL: redis://redis:6379/0
+      TFMS_QUEUE_NAME: landgbnb.gmail.com.TFMS.3b02c856-4246-4fa3-8c92-a7c2a37d2176.OUT
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  tfms_postgres_data:

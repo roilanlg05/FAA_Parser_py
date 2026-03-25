@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ns5:MessageCollection xmlns:ns5="http://www.faa.aero/nas/3.0"
+  xmlns:ns2="http://www.fixm.aero/base/3.0"
+  xmlns:ns3="http://www.fixm.aero/flight/3.0"
+  xmlns:ns4="http://www.fixm.aero/foundation/3.0">
+  <message xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="ns5:FlightMessageType">
+    <flight xsi:type="ns5:NasFlightType" centre="ZFW" source="HP" system="SLC" timestamp="2026-03-25T00:21:59.997Z">
+      <arrival xsi:type="ns5:NasArrivalType" arrivalPoint="KDAL">
+        <runwayPositionAndTime>
+          <runwayTime>
+            <estimated time="2026-03-25T00:48:00Z"/>
+          </runwayTime>
+        </runwayPositionAndTime>
+      </arrival>
+      <departure xsi:type="ns5:NasDepartureType" departurePoint="KELP">
+        <runwayPositionAndTime>
+          <runwayTime>
+            <actual time="2026-03-24T23:23:00Z"/>
+          </runwayTime>
+        </runwayPositionAndTime>
+      </departure>
+      <flightIdentification xsi:type="ns5:NasFlightIdentificationType" computerId="610" siteSpecificPlanId="185" aircraftIdentification="DAL565"/>
+      <flightStatus xsi:type="ns5:NasFlightStatusType" fdpsFlightStatus="ACTIVE"/>
+      <gufi codeSpace="urn:uuid">2bb3ef04-7f46-4ed4-8145-78c6bb5bb3cb</gufi>
+      <operator><operatingOrganization><organization name="DAL"/></operatingOrganization></operator>
+      <supplementalData xsi:type="ns5:NasSupplementalDataType">
+        <additionalFlightInformation>
+          <nameValue name="MSG_SEQ_NO" value="73835333"/>
+          <nameValue name="FDPS_GUFI" value="us.fdps.2026-03-24T21:31:11Z.000/00/3Vk"/>
+        </additionalFlightInformation>
+      </supplementalData>
+      <flightPlan identifier="KA774713Vk"/>
+    </flight>
+  </message>
+</ns5:MessageCollection>

@@ -1,0 +1,14 @@
+{
+  "attached_file_validation": {
+    "payload_type": "asdex_surface_movement_event",
+    "airport": "KCLT",
+    "report_count": 51
+  },
+  "sfdps_sample_validation": {
+    "payload_type": "sfdps_message_collection",
+    "message_count": 1,
+    "projected_flight_id": "DAL565",
+    "projected_gufi": "2bb3ef04-7f46-4ed4-8145-78c6bb5bb3cb",
+    "arrival_airport": "KDAL"
+  }
+}

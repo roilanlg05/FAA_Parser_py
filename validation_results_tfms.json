@@ -1,0 +1,16 @@
+{
+  "unit_tests_command": "python3 -m unittest tests/test_tfms_parser.py",
+  "unit_tests_output": "....\n----------------------------------------------------------------------\nRan 4 tests in 0.035s\n\nOK\n",
+  "compiled_files": [
+    "python-app/app/tfms_parser.py",
+    "python-app/app/db.py",
+    "python-app/app/main.py",
+    "python-app/tfms_consumer.py"
+  ],
+  "sample_outputs": [
+    "examples_flight_sectors.parsed.json",
+    "Pasted text (2).parsed.json",
+    "Pasted text (3).parsed.json",
+    "examples_tmi_flight_list.parsed.json"
+  ]
+}

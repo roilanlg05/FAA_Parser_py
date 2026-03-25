@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from .config import settings
+from .redis_client import RedisManager
+from .tfms_models import TfmsEvent, TfmsProjection
+from .tfms_parser_adapter import build_tfms_projections, parse_tfms_xml
+
+logger = logging.getLogger(__name__)
+
+
+def _strip_raw_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _strip_raw_fields(v) for k, v in value.items() if k != 'raw'}
+    if isinstance(value, list):
+        return [_strip_raw_fields(item) for item in value]
+    return value
+
+
+def _root_facility_and_msg(parsed: dict[str, Any]) -> tuple[str | None, str | None, str | None, str | None]:
+    payload_type = parsed.get('payload_type')
+    if payload_type == 'tfms_flight_data_output':
+        first = (parsed.get('messages') or [None])[0] or {}
+        body = first.get('body') or {}
+        qid = body.get('qualifiedAircraftId') or {}
+        return (
+            first.get('sourceFacility'),
+            first.get('msgType'),
+            first.get('flightRef'),
+            qid.get('aircraftId') or first.get('acid'),
+        )
+    if payload_type == 'tfms_flow_information_output':
+        first = (parsed.get('messages') or [None])[0] or {}
+        tmi_first = (first.get('tmiFlightDataList') or [None])[0] or {}
+        flight = tmi_first.get('flight') or {}
+        return (
+            first.get('sourceFacility'),
+            first.get('msgType'),
+            tmi_first.get('flightReference'),
+            flight.get('aircraftId'),
+        )
+    if payload_type == 'tfms_status_output':
+        first = (parsed.get('statuses') or [None])[0] or {}
+        return (first.get('facility'), 'status', None, None)
+    return (None, None, None, None)
+
+
+async def ingest_tfms_xml(
+    session: AsyncSession,
+    redis_manager: RedisManager,
+    *,
+    xml_text: str,
+    queue_name: str | None,
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    parsed = parse_tfms_xml(xml_text)
+    source_facility, msg_type, flight_ref, acid = _root_facility_and_msg(parsed)
+    projections = build_tfms_projections(parsed)
+    gufi = projections[0].get('gufi') if projections else None
+
+    event = TfmsEvent(
+        queue_name=queue_name or settings.tfms_queue_name,
+        payload_type=parsed.get('payload_type') or 'unknown',
+        root_tag=parsed.get('root_tag'),
+        source_facility=source_facility,
+        msg_type=msg_type,
+        flight_ref=flight_ref,
+        acid=acid,
+        gufi=gufi,
+        raw_xml=xml_text,
+        parsed_json=parsed,
+    )
+    session.add(event)
+
+    for projection in projections:
+        key = projection.get('key')
+        if not key:
+            continue
+        existing = await session.get(TfmsProjection, key)
+        if existing is None:
+            existing = TfmsProjection(projection_key=key)
+            session.add(existing)
+        existing.projection_type = projection.get('projection_type') or 'unknown'
+        existing.acid = projection.get('acid')
+        existing.gufi = projection.get('gufi')
+        existing.flight_ref = projection.get('flightRef')
+        existing.msg_type = projection.get('msgType')
+        existing.source_facility = projection.get('sourceFacility')
+        existing.source_timestamp = projection.get('sourceTimeStamp')
+        existing.data = projection.get('data') or {}
+
+    await session.commit()
+    await session.refresh(event)
+
+    try:
+        redis = await redis_manager.connect_tfms()
+        compact_parsed = _strip_raw_fields(parsed)
+        event_payload = {
+            'event_id': event.id,
+            'queue_name': event.queue_name,
+            'payload_type': event.payload_type,
+            'parsed': compact_parsed,
+            'metadata': metadata or {},
+        }
+        await redis.publish(settings.tfms_events_channel_name, json.dumps(event_payload, ensure_ascii=False))
+
+        for projection in projections:
+            data = projection.get('data') or {}
+            projection_payload = {
+                'projection_type': projection.get('projection_type'),
+                'projection_key': projection.get('key'),
+                'acid': projection.get('acid'),
+                'gufi': projection.get('gufi'),
+                'flight_ref': projection.get('flightRef'),
+                'msg_type': projection.get('msgType'),
+                'source_facility': projection.get('sourceFacility'),
+                'source_timestamp': projection.get('sourceTimeStamp'),
+                'data': _strip_raw_fields(data),
+            }
+            await redis.publish(settings.tfms_projections_channel_name, json.dumps(projection_payload, ensure_ascii=False))
+    except Exception:
+        logger.exception('Failed to publish TFMS redis notifications event_id=%s', event.id)
+
+    return {
+        'status': 'accepted',
+        'event_id': event.id,
+        'payload_type': event.payload_type,
+        'projection_count': len(projections),
+        'queue_name': event.queue_name,
+        'parsed': parsed,
+    }
+
+
+async def get_tfms_events(session: AsyncSession, limit: int = 100) -> list[TfmsEvent]:
+    stmt = select(TfmsEvent).order_by(TfmsEvent.created_at.desc()).limit(limit)
+    result = await session.execute(stmt)
+    return list(result.scalars())
+
+
+async def get_tfms_projections(session: AsyncSession, limit: int = 100) -> list[TfmsProjection]:
+    stmt = select(TfmsProjection).order_by(TfmsProjection.updated_at.desc()).limit(limit)
+    result = await session.execute(stmt)
+    return list(result.scalars())

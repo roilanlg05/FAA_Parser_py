@@ -1,0 +1,160 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: faa_swim
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+
+  redis-sfdps:
+    image: redis:7
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_sfdps_data:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    restart: unless-stopped
+
+  redis-tfms:
+    image: redis:7
+    command: ["redis-server", "/usr/local/etc/redis/redis-tfms.conf"]
+    ports:
+      - '6380:6379'
+    volumes:
+      - redis_tfms_data:/data
+      - ./docker/redis/redis-tfms.conf:/usr/local/etc/redis/redis-tfms.conf:ro
+    restart: unless-stopped
+
+  redis-tbfm:
+    image: redis:7
+    command: ["redis-server", "/usr/local/etc/redis/redis-tfms.conf"]
+    ports:
+      - '6381:6379'
+    volumes:
+      - redis_tbfm_data:/data
+      - ./docker/redis/redis-tfms.conf:/usr/local/etc/redis/redis-tfms.conf:ro
+    restart: unless-stopped
+
+  fastapi:
+    image: python:3.12-slim
+    working_dir: /app
+    command: bash -lc "pip install -r requirements.txt && uvicorn app.main:app --host 0.0.0.0 --port 8000 --ws-ping-interval 30 --ws-ping-timeout 180 --ws-max-size 16777216"
+    volumes:
+      - ./python-app:/app
+      - ./python-app/tfms/app:/tfms-app:ro
+      - ./python-app/tbfm/app:/tbfm-app:ro
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/faa_swim
+      TFMS_DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/tfms
+      SFDPS_REDIS_URL: redis://redis-sfdps:6379/0
+      TFMS_REDIS_URL: redis://redis-tfms:6379/0
+      TBFM_REDIS_URL: redis://redis-tbfm:6379/0
+      ENABLE_WORKER: 'true'
+      RAW_STREAM_NAME: faa.raw.xml
+      PARSED_STREAM_NAME: faa.parsed.json
+      PARSED_CHANNEL_NAME: faa.parsed.events
+      CONSUMER_GROUP: faa-python-parser
+      CONSUMER_NAME: worker-1
+      TFMS_QUEUE_NAME: ${TFMS_QUEUE_NAME}
+      TFMS_PARSER_PATH: /tfms-app/tfms_parser.py
+      TFMS_EVENTS_CHANNEL_NAME: tfms.events
+      TFMS_PROJECTIONS_CHANNEL_NAME: tfms.projections
+      TFMS_RAW_STREAM_NAME: ${TFMS_RAW_STREAM_NAME:-tfms.raw.xml}
+      TFMS_CONSUMER_GROUP: ${TFMS_CONSUMER_GROUP:-tfms-python-parser}
+      TFMS_CONSUMER_NAME: ${TFMS_CONSUMER_NAME:-tfms-worker-1}
+      TBFM_DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/tbfm
+      TBFM_QUEUE_NAME: ${TBFM_QUEUE_NAME:-landgbnb.gmail.com.TBFM.3766a42b-c0b9-4848-9898-2e7bff589b66.OUT}
+      TBFM_PARSER_PATH: /tbfm-app/tbfm_parser.py
+      TBFM_PROJECTIONS_PATH: /tbfm-app/projections.py
+      TBFM_EVENTS_CHANNEL_NAME: tbfm.events
+      TBFM_PROJECTIONS_CHANNEL_NAME: tbfm.projections
+      TBFM_RAW_STREAM_NAME: ${TBFM_RAW_STREAM_NAME:-tbfm.raw.xml}
+      TBFM_CONSUMER_GROUP: ${TBFM_CONSUMER_GROUP:-tbfm-python-parser}
+      TBFM_CONSUMER_NAME: ${TBFM_CONSUMER_NAME:-tbfm-worker-1}
+    depends_on:
+      - postgres
+      - redis-sfdps
+      - redis-tfms
+      - redis-tbfm
+    ports:
+      - '8000:8000'
+    restart: unless-stopped
+
+  jms-bridge:
+    image: maven:3.9-eclipse-temurin-17
+    working_dir: /app
+    command: bash -lc "mvn -q -DskipTests package && java -jar target/faa-swim-jms-bridge-0.1.0.jar"
+    volumes:
+      - ./jms-bridge:/app
+      - ./certs:/certs:ro
+    environment:
+      SOLACE_HOST: ${SOLACE_HOST}
+      SOLACE_VPN: ${SOLACE_VPN}
+      SOLACE_USERNAME: ${SOLACE_USERNAME}
+      SOLACE_PASSWORD: ${SOLACE_PASSWORD}
+      SOLACE_QUEUE_NAME: ${SOLACE_QUEUE_NAME}
+      SOLACE_CLIENT_NAME: ${SOLACE_CLIENT_NAME:-faa-swim-jms-bridge}
+      REDIS_URL: redis://redis-sfdps:6379
+      RAW_STREAM_NAME: ${RAW_STREAM_NAME:-faa.raw.xml}
+      RAW_STREAM_MAXLEN: ${RAW_STREAM_MAXLEN:-200000}
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:-}
+    depends_on:
+      - redis-sfdps
+    restart: unless-stopped
+
+  tfms-jms-bridge:
+    image: maven:3.9-eclipse-temurin-17
+    working_dir: /app
+    command: bash -lc "mvn -q -DskipTests package && java -jar target/tfms-jms-bridge-1.0.0-jar-with-dependencies.jar"
+    volumes:
+      - ./jms-bridge/tfms:/app
+      - ./certs:/certs:ro
+    environment:
+      SOLACE_HOST: ${TFMS_SOLACE_HOST}
+      SOLACE_VPN: ${TFMS_SOLACE_VPN}
+      SOLACE_USERNAME: ${TFMS_SOLACE_USERNAME}
+      SOLACE_PASSWORD: ${TFMS_SOLACE_PASSWORD}
+      TFMS_QUEUE_NAME: ${TFMS_QUEUE_NAME}
+      REDIS_URL: redis://redis-tfms:6379
+      TFMS_RAW_STREAM_NAME: ${TFMS_RAW_STREAM_NAME:-tfms.raw.xml}
+      TFMS_RAW_STREAM_MAXLEN: ${TFMS_RAW_STREAM_MAXLEN:-200000}
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:-}
+    depends_on:
+      - redis-tfms
+    restart: unless-stopped
+
+  tbfm-jms-bridge:
+    image: maven:3.9-eclipse-temurin-17
+    working_dir: /app
+    command:
+      - bash
+      - -lc
+      - if [ -z "$$SOLACE_HOST" ]; then echo "TBFM bridge idle; set TBFM_SOLACE env vars"; sleep infinity; fi; rm -rf /root/.m2/repository/com/google/code/gson/gson/2.11.0 && mvn -q -DskipTests package && java -jar target/tbfm-jms-bridge-1.0.0-jar-with-dependencies.jar
+    volumes:
+      - ./jms-bridge/tbfm:/app
+      - ./certs:/certs:ro
+    environment:
+      SOLACE_HOST: ${TBFM_SOLACE_HOST:-}
+      SOLACE_VPN: ${TBFM_SOLACE_VPN:-}
+      SOLACE_USERNAME: ${TBFM_SOLACE_USERNAME:-}
+      SOLACE_PASSWORD: ${TBFM_SOLACE_PASSWORD:-}
+      TBFM_QUEUE_NAME: ${TBFM_QUEUE_NAME:-landgbnb.gmail.com.TBFM.3766a42b-c0b9-4848-9898-2e7bff589b66.OUT}
+      REDIS_URL: redis://redis-tbfm:6379
+      TBFM_RAW_STREAM_NAME: ${TBFM_RAW_STREAM_NAME:-tbfm.raw.xml}
+      TBFM_RAW_STREAM_MAXLEN: ${TBFM_RAW_STREAM_MAXLEN:-200000}
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:-}
+    depends_on:
+      - redis-tbfm
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_sfdps_data:
+  redis_tfms_data:
+  redis_tbfm_data:

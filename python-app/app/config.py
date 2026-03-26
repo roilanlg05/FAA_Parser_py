@@ -35,6 +35,12 @@ class Settings:
         'TFMS_PARSER_PATH',
         '/Users/hashdown/Projects/FAA_Parser_py/python-app/tfms/app/tfms_parser.py',
     )
+    tfms_raw_response_from_xml: bool = os.getenv('TFMS_RAW_RESPONSE_FROM_XML', 'true').lower() in {
+        '1',
+        'true',
+        'yes',
+        'on',
+    }
     tbfm_database_url: str = os.getenv('TBFM_DATABASE_URL', 'postgresql+asyncpg://postgres:postgres@localhost:5432/tbfm')
     tbfm_events_channel_name: str = os.getenv('TBFM_EVENTS_CHANNEL_NAME', 'tbfm.events')
     tbfm_projections_channel_name: str = os.getenv('TBFM_PROJECTIONS_CHANNEL_NAME', 'tbfm.projections')
@@ -55,6 +61,12 @@ class Settings:
         'TBFM_PROJECTIONS_PATH',
         '/Users/hashdown/Projects/FAA_Parser_py/python-app/tbfm/app/projections.py',
     )
+    tbfm_raw_response_from_xml: bool = os.getenv('TBFM_RAW_RESPONSE_FROM_XML', 'true').lower() in {
+        '1',
+        'true',
+        'yes',
+        'on',
+    }
 
 
 settings = Settings()

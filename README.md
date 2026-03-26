@@ -76,19 +76,19 @@ PY
 - `GET /events?limit=50`
 - `GET /flights/current?limit=50`
 - `GET /flights/current/{gufi}`
-- `WS /ws/flights` (filtro por `callsign`, `gufi`, `destination`)
+- `WS /ws/flights` (filtros: `callsign`, `gufi`, `airport`, `destination`, `departure`, `date`, `limit`)
 - `WS /ws/tfms` (filtro TFMS por `acid`, `gufi`, `msg_type`, etc.)
 - `POST /ingest/tfms/raw` (debug/manual inject; pipeline productivo usa stream)
 - `GET /tfms/ingest/stats`
-- `GET /tfms/events?limit=100`
-- `GET /tfms/projections?limit=100`
-- `GET /tfms/projections/{projection_key}`
+- `GET /tfms/events?limit=100&raw=false`
+- `GET /tfms/projections?limit=100&raw=false`
+- `GET /tfms/projections/{projection_key}?raw=false`
 - `WS /ws/tbfm` (filtro TBFM por `acid`, `tma_id`, `msg_type`, etc.)
 - `POST /ingest/tbfm/raw` (debug/manual inject; pipeline productivo usa stream)
 - `GET /tbfm/ingest/stats`
-- `GET /tbfm/events?limit=100`
-- `GET /tbfm/projections?limit=100`
-- `GET /tbfm/projections/{projection_key}`
+- `GET /tbfm/events?limit=100&raw=false`
+- `GET /tbfm/projections?limit=100&raw=false`
+- `GET /tbfm/projections/{projection_key}?raw=false`
 
 ## WebSocket de vuelos
 
@@ -99,11 +99,15 @@ Conecta a:
 - `ws://localhost:8000/ws/flights?gufi=14dcdcc2-adc1-40ab-888c-153043fb1aeb`
 - `ws://localhost:8000/ws/flights?destination=KSDF`
 - `ws://localhost:8000/ws/flights?airport=KSDF`
+- `ws://localhost:8000/ws/flights?departure=KSDF`
+- `ws://localhost:8000/ws/flights?date=2026-03-26&limit=25`
 
-Reglas de filtro para aeropuerto:
+Reglas de filtro:
 
-- `destination` / `destino`: coincide solo con `arrival.airport`.
-- `airport` / `aeropuerto` / `aereopuerto`: coincide con `arrival.airport` o `departure.airport`.
+- `destination`: coincide solo con `arrival.airport`.
+- `airport`: coincide con `arrival.airport` o `departure.airport`.
+- `departure`: coincide solo con `departure.airport`.
+- `date`: formato `YYYY-MM-DD`, aplicado sobre `source_timestamp` y con fallback a `updated_at`.
 
 Al conectar, el servidor envia un mensaje `snapshot` con vuelos actuales que cumplen el filtro.
 Despues envia mensajes `event` en tiempo real cuando llega un payload que coincide.
@@ -119,6 +123,9 @@ Tambien puedes cambiar la suscripcion en caliente enviando JSON por el socket:
   "gufi": "14dcdcc2-adc1-40ab-888c-153043fb1aeb",
   "destination": "KSDF",
   "airport": "KSDF",
+  "departure": "KSDF",
+  "date": "2026-03-26",
+  "limit": 25,
   "snapshot": true
 }
 ```
@@ -149,6 +156,22 @@ Mensajes del servidor:
 - `snapshot` (proyecciones actuales filtradas)
 - `event` (evento TFMS del canal `tfms.events`)
 - `projection` (actualizacion de proyeccion del canal `tfms.projections`)
+
+`WS /ws/tfms` publica eventos compactos (sin ramas `raw`) para reducir latencia y consumo de memoria.
+
+Toggle raw en REST TFMS:
+
+- `raw=false` (default): payload compacto, sin duplicados `raw`.
+- `raw=true`: vista raw-only.
+- Endpoints: `/tfms/events`, `/tfms/projections`, `/tfms/projections/{projection_key}`.
+
+Ejemplos:
+
+```bash
+curl -s "http://localhost:8000/tfms/events?limit=5&raw=false"
+curl -s "http://localhost:8000/tfms/events?limit=5&raw=true"
+curl -s "http://localhost:8000/tfms/projections?limit=5&raw=true"
+```
 
 Cambio de suscripcion en caliente:
 
@@ -182,6 +205,22 @@ Filtros soportados:
 - `projection_type`
 - `projection_key`
 - `queue_name`
+
+`WS /ws/tbfm` publica eventos compactos (sin ramas `raw`) para reducir latencia y consumo de memoria.
+
+Toggle raw en REST TBFM:
+
+- `raw=false` (default): payload compacto, sin duplicados `raw`.
+- `raw=true`: vista raw-only.
+- Endpoints: `/tbfm/events`, `/tbfm/projections`, `/tbfm/projections/{projection_key}`.
+
+Ejemplos:
+
+```bash
+curl -s "http://localhost:8000/tbfm/events?limit=5&raw=false"
+curl -s "http://localhost:8000/tbfm/events?limit=5&raw=true"
+curl -s "http://localhost:8000/tbfm/projections?limit=5&raw=true"
+```
 
 ## Operacion diaria (runbook rapido)
 
@@ -242,6 +281,26 @@ docker compose restart fastapi
   - `docker compose exec -T redis-tbfm redis-cli XLEN tbfm.raw.xml`
   - `docker compose logs tbfm-jms-bridge --no-color`
   - si ves `TBFM bridge idle; set TBFM_SOLACE env vars`, faltan credenciales/host TBFM en `.env`
+
+Backfill recomendado para limpiar JSON historico TFMS (remover ramas `raw` embebidas):
+
+```bash
+docker compose exec -T fastapi python scripts/backfill_tfms_compact_payloads.py --batch-size 500
+docker compose exec -T fastapi python scripts/backfill_tfms_compact_payloads.py --batch-size 500 --max-batches 20
+docker compose exec -T fastapi python scripts/backfill_tbfm_compact_payloads.py --batch-size 500
+docker compose exec -T fastapi python scripts/backfill_tbfm_compact_payloads.py --batch-size 500 --max-batches 20
+```
+
+Mantenimiento de almacenamiento SFDPS (`raw_events`):
+
+```bash
+docker compose exec -T fastapi python scripts/sfdps_storage_maintenance.py baseline
+docker compose exec -T fastapi python scripts/sfdps_storage_maintenance.py archive --retention-days 60 --batch-size 10000 --dry-run
+docker compose exec -T fastapi python scripts/sfdps_storage_maintenance.py archive --retention-days 60 --batch-size 10000
+docker compose exec -T fastapi python scripts/sfdps_storage_maintenance.py vacuum
+```
+
+- Si `vacuum` reporta `DiskFullError` por shared memory, primero libera espacio del host/docker y reintenta.
 - Si el puerto 5432 esta ocupado por otro contenedor local, detenlo antes de levantar este stack.
 
 ## Diseño de tablas

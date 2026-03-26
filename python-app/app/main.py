@@ -13,7 +13,7 @@ from uuid import uuid4
 from xml.etree.ElementTree import ParseError
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import Date, cast, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
@@ -21,13 +21,19 @@ from .db import Base, AsyncSessionLocal, engine, get_db_session
 from .models import FlightCurrent
 from .redis_client import RedisManager
 from .schemas import EventResponse, HealthResponse, IngestRequest
-from .service import get_current_flights, get_recent_events, ingest_xml
+from .service import get_recent_events, ingest_xml
 from .tfms_db import TfmsAsyncSessionLocal, tfms_engine
-from .tfms_models import TfmsBase, TfmsProjection
+from .tfms_models import TfmsBase, TfmsEvent, TfmsProjection
+from .tfms_parser_adapter import parse_tfms_xml
+from .tfms_payload_utils import only_raw_fields, projection_raw_by_key_from_xml, strip_raw_fields
 from .tfms_schemas import TfmsEventResponse, TfmsIngestRequest, TfmsProjectionResponse
 from .tfms_service import get_tfms_events, get_tfms_projections, ingest_tfms_xml
 from .tbfm_db import TbfmAsyncSessionLocal, tbfm_engine
-from .tbfm_models import TbfmBase, TbfmProjection
+from .tbfm_models import TbfmBase, TbfmEvent, TbfmProjection
+from .tbfm_parser_adapter import parse_tbfm_xml
+from .tbfm_payload_utils import only_raw_fields as only_tbfm_raw_fields
+from .tbfm_payload_utils import projection_raw_by_key_from_xml as tbfm_projection_raw_by_key_from_xml
+from .tbfm_payload_utils import strip_raw_fields as strip_tbfm_raw_fields
 from .tbfm_schemas import TbfmEventResponse, TbfmIngestRequest, TbfmProjectionResponse
 from .tbfm_service import get_tbfm_events, get_tbfm_projections, ingest_tbfm_xml
 from .worker import StreamWorker, TbfmStreamWorker, TfmsStreamWorker
@@ -142,24 +148,40 @@ def _matches_msg_type(value: str | None, expected: str | None) -> bool:
 
 
 def _flight_matches_subscription(
-    flight: dict[str, Any], *, callsign: str | None, gufi: str | None, destination: str | None, airport: str | None
+    flight: dict[str, Any],
+    *,
+    callsign: str | None,
+    gufi: str | None,
+    destination: str | None,
+    airport: str | None,
+    departure: str | None,
+    date: str | None,
 ) -> bool:
     flight_gufi = flight.get('gufi')
     flight_destination = (flight.get('arrival') or {}).get('airport')
     flight_departure = (flight.get('departure') or {}).get('airport')
     flight_identification = flight.get('flight_identification') or {}
     aircraft_identification = flight_identification.get('aircraft_identification')
+    timestamp = (flight.get('meta') or {}).get('timestamp') or flight.get('source_timestamp') or flight.get('updated_at')
     airport_matches = True
+    departure_matches = True
+    date_matches = True
     if airport is not None:
         airport_matches = (
             _matches_filter(flight_destination, airport, case_insensitive=True)
             or _matches_filter(flight_departure, airport, case_insensitive=True)
         )
+    if departure is not None:
+        departure_matches = _matches_filter(flight_departure, departure, case_insensitive=True)
+    if date is not None:
+        date_matches = isinstance(timestamp, str) and timestamp.startswith(date)
     return (
         _matches_filter(aircraft_identification, callsign, case_insensitive=True)
         and _matches_filter(flight_gufi, gufi)
         and _matches_filter(flight_destination, destination, case_insensitive=True)
         and airport_matches
+        and departure_matches
+        and date_matches
     )
 
 
@@ -218,17 +240,30 @@ def _canonical_flight(
 
 
 def _normalize_destination_filter(payload: dict[str, Any]) -> str | None:
-    destination = payload.get('destination') or payload.get('destino')
+    destination = payload.get('destination')
     if isinstance(destination, str) and destination:
         return destination.upper()
     return None
 
 
 def _normalize_airport_filter(payload: dict[str, Any]) -> str | None:
-    airport = payload.get('airport') or payload.get('aeropuerto') or payload.get('aereopuerto')
+    airport = payload.get('airport')
     if isinstance(airport, str) and airport:
         return airport.upper()
     return None
+
+
+def _normalize_departure_filter(payload: dict[str, Any]) -> str | None:
+    departure = payload.get('departure')
+    if isinstance(departure, str) and departure:
+        return departure.upper()
+    return None
+
+
+def _normalize_date_filter(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return datetime.strptime(value, '%Y-%m-%d').date().isoformat()
 
 
 def _normalize_tfms_subscription(payload: dict[str, Any]) -> dict[str, Any]:
@@ -508,6 +543,8 @@ def _extract_canonical_flights(
     gufi: str | None,
     destination: str | None,
     airport: str | None,
+    departure: str | None,
+    date: str | None,
 ) -> list[dict[str, Any]]:
     messages = parsed_payload.get('messages')
     if not isinstance(messages, list):
@@ -525,6 +562,8 @@ def _extract_canonical_flights(
             gufi=gufi,
             destination=destination,
             airport=airport,
+            departure=departure,
+            date=date,
         ):
             continue
         matches.append(
@@ -540,7 +579,14 @@ def _extract_canonical_flights(
 
 
 def _filter_sfdps_parsed_messages(
-    parsed_payload: dict[str, Any], *, callsign: str | None, gufi: str | None, destination: str | None, airport: str | None
+    parsed_payload: dict[str, Any],
+    *,
+    callsign: str | None,
+    gufi: str | None,
+    destination: str | None,
+    airport: str | None,
+    departure: str | None,
+    date: str | None,
 ) -> dict[str, Any] | None:
     messages = parsed_payload.get('messages')
     if not isinstance(messages, list):
@@ -559,6 +605,8 @@ def _filter_sfdps_parsed_messages(
             gufi=gufi,
             destination=destination,
             airport=airport,
+            departure=departure,
+            date=date,
         ):
             filtered_messages.append(message)
 
@@ -578,9 +626,11 @@ async def _fetch_snapshot(
     gufi: str | None,
     destination: str | None,
     airport: str | None,
+    departure: str | None,
+    date: str | None,
     limit: int = 25,
 ) -> list[dict[str, Any]]:
-    stmt = select(FlightCurrent).order_by(FlightCurrent.updated_at.desc()).limit(limit)
+    stmt = select(FlightCurrent)
     if gufi:
         stmt = stmt.where(FlightCurrent.gufi == gufi)
     if callsign:
@@ -594,6 +644,12 @@ async def _fetch_snapshot(
                 FlightCurrent.departure_airport == airport.upper(),
             )
         )
+    if departure:
+        stmt = stmt.where(FlightCurrent.departure_airport == departure.upper())
+    if date:
+        parsed_date = datetime.strptime(date, '%Y-%m-%d').date()
+        stmt = stmt.where(func.coalesce(cast(FlightCurrent.source_timestamp, Date), cast(FlightCurrent.updated_at, Date)) == parsed_date)
+    stmt = stmt.order_by(FlightCurrent.updated_at.desc()).limit(limit)
     result = await session.execute(stmt)
     rows = list(result.scalars())
     flights: list[dict[str, Any]] = []
@@ -634,6 +690,8 @@ async def _fetch_snapshot(
             gufi=gufi,
             destination=destination,
             airport=airport,
+            departure=departure,
+            date=date,
         )
     ]
 
@@ -807,6 +865,8 @@ async def list_events(limit: int = 50, session: AsyncSession = Depends(get_db_se
                 gufi=None,
                 destination=None,
                 airport=None,
+                departure=None,
+                date=None,
             ),
             received_at=row.received_at,
         )
@@ -820,68 +880,30 @@ async def list_current_flights(
     callsign: str | None = None,
     gufi: str | None = None,
     destination: str | None = None,
-    destino: str | None = None,
     airport: str | None = None,
-    aeropuerto: str | None = None,
-    aereopuerto: str | None = None,
+    departure: str | None = None,
+    date: str | None = None,
     session: AsyncSession = Depends(get_db_session),
 ) -> list[dict[str, Any]]:
-    destination_filter = _normalize_destination_filter(
-        {
-            'destination': destination,
-            'destino': destino,
-        }
-    )
-    airport_filter = _normalize_airport_filter(
-        {
-            'airport': airport,
-            'aeropuerto': aeropuerto,
-            'aereopuerto': aereopuerto,
-        }
-    )
+    destination_filter = _normalize_destination_filter({'destination': destination})
+    airport_filter = _normalize_airport_filter({'airport': airport})
+    departure_filter = _normalize_departure_filter({'departure': departure})
+    try:
+        date_filter = _normalize_date_filter(date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail='Invalid date format. Use YYYY-MM-DD')
     callsign_filter = callsign.upper() if isinstance(callsign, str) and callsign else None
     gufi_filter = gufi if isinstance(gufi, str) and gufi else None
-
-    rows = await get_current_flights(session, limit)
-    flights: list[dict[str, Any]] = []
-    for row in rows:
-        base_flight: dict[str, Any] = row.last_payload if isinstance(row.last_payload, dict) else {}
-        if not base_flight:
-            base_flight = {
-                'gufi': row.gufi,
-                'operator': row.operator,
-                'flight_status': row.status,
-                'arrival': {
-                    'airport': row.arrival_airport,
-                    'estimated_runway_time': _iso_or_none(row.arrival_estimated_time),
-                },
-                'departure': {
-                    'airport': row.departure_airport,
-                    'actual_runway_time': _iso_or_none(row.departure_actual_time),
-                },
-                'meta': {'timestamp': _iso_or_none(row.source_timestamp)},
-                'flight_identification': {'aircraft_identification': row.flight_id},
-            }
-        flights.append(
-            _canonical_flight(
-                base_flight,
-                payload_type=row.payload_type,
-                stream_id=row.last_stream_id,
-                source='solace-jms',
-                updated_at=row.updated_at,
-            )
-        )
-    return [
-        flight
-        for flight in flights
-        if _flight_matches_subscription(
-            flight,
-            callsign=callsign_filter,
-            gufi=gufi_filter,
-            destination=destination_filter,
-            airport=airport_filter,
-        )
-    ]
+    return await _fetch_snapshot(
+        session,
+        callsign=callsign_filter,
+        gufi=gufi_filter,
+        destination=destination_filter,
+        airport=airport_filter,
+        departure=departure_filter,
+        date=date_filter,
+        limit=limit,
+    )
 
 
 @app.get('/flights/current/{gufi}', response_model=dict[str, Any])
@@ -916,7 +938,7 @@ async def get_current_flight(gufi: str, session: AsyncSession = Depends(get_db_s
 
 
 @app.get('/tfms/events', response_model=list[TfmsEventResponse])
-async def list_tfms_events(limit: int = 100) -> list[TfmsEventResponse]:
+async def list_tfms_events(limit: int = 100, raw: bool = False) -> list[TfmsEventResponse]:
     async with TfmsAsyncSessionLocal() as session:
         rows = await get_tfms_events(session, limit)
     return [
@@ -930,7 +952,15 @@ async def list_tfms_events(limit: int = 100) -> list[TfmsEventResponse]:
             flight_ref=row.flight_ref,
             acid=row.acid,
             gufi=row.gufi,
-            parsed_json=row.parsed_json,
+            parsed_json=(
+                (
+                    only_raw_fields(parse_tfms_xml(row.raw_xml))
+                    if settings.tfms_raw_response_from_xml
+                    else only_raw_fields(row.parsed_json or {})
+                )
+                if raw
+                else strip_raw_fields(row.parsed_json or {})
+            ),
             created_at=row.created_at,
         )
         for row in rows
@@ -938,9 +968,30 @@ async def list_tfms_events(limit: int = 100) -> list[TfmsEventResponse]:
 
 
 @app.get('/tfms/projections', response_model=list[TfmsProjectionResponse])
-async def list_tfms_projections(limit: int = 100) -> list[TfmsProjectionResponse]:
+async def list_tfms_projections(limit: int = 100, raw: bool = False) -> list[TfmsProjectionResponse]:
     async with TfmsAsyncSessionLocal() as session:
         rows = await get_tfms_projections(session, limit)
+        raw_by_key: dict[str, dict[str, Any]] = {}
+        if raw and rows and settings.tfms_raw_response_from_xml:
+            candidates = await session.execute(
+                select(TfmsEvent).order_by(TfmsEvent.id.desc()).limit(max(limit * 5, 200))
+            )
+            recent_events = list(candidates.scalars())
+            for row in rows:
+                value: dict[str, Any] | None = None
+                for event in recent_events:
+                    if event.msg_type and row.msg_type and event.msg_type != row.msg_type:
+                        continue
+                    if event.acid and row.acid and event.acid != row.acid:
+                        continue
+                    if event.gufi and row.gufi and event.gufi != row.gufi:
+                        continue
+                    if event.flight_ref and row.flight_ref and event.flight_ref != row.flight_ref:
+                        continue
+                    value = projection_raw_by_key_from_xml(event.raw_xml, row.projection_key)
+                    if value:
+                        break
+                raw_by_key[row.projection_key] = value or {}
     return [
         TfmsProjectionResponse(
             projection_key=row.projection_key,
@@ -951,7 +1002,11 @@ async def list_tfms_projections(limit: int = 100) -> list[TfmsProjectionResponse
             msg_type=row.msg_type,
             source_facility=row.source_facility,
             source_timestamp=row.source_timestamp,
-            data=row.data,
+            data=(
+                raw_by_key.get(row.projection_key, {})
+                if raw and settings.tfms_raw_response_from_xml
+                else (only_raw_fields(row.data or {}) if raw else strip_raw_fields(row.data or {}))
+            ),
             updated_at=row.updated_at,
         )
         for row in rows
@@ -959,9 +1014,33 @@ async def list_tfms_projections(limit: int = 100) -> list[TfmsProjectionResponse
 
 
 @app.get('/tfms/projections/{projection_key}', response_model=TfmsProjectionResponse)
-async def get_tfms_projection(projection_key: str) -> TfmsProjectionResponse:
+async def get_tfms_projection(projection_key: str, raw: bool = False) -> TfmsProjectionResponse:
     async with TfmsAsyncSessionLocal() as session:
         row = await session.get(TfmsProjection, projection_key)
+        raw_data: dict[str, Any] = {}
+        if raw and row is not None and settings.tfms_raw_response_from_xml:
+            stmt = select(TfmsEvent)
+            if row.msg_type:
+                stmt = stmt.where(TfmsEvent.msg_type == row.msg_type)
+            if row.acid:
+                stmt = stmt.where(TfmsEvent.acid == row.acid)
+            if row.gufi:
+                stmt = stmt.where(TfmsEvent.gufi == row.gufi)
+            if row.flight_ref:
+                stmt = stmt.where(TfmsEvent.flight_ref == row.flight_ref)
+            candidates = await session.execute(stmt.order_by(TfmsEvent.id.desc()).limit(5000))
+            for event in list(candidates.scalars()):
+                if event.msg_type and row.msg_type and event.msg_type != row.msg_type:
+                    continue
+                if event.acid and row.acid and event.acid != row.acid:
+                    continue
+                if event.gufi and row.gufi and event.gufi != row.gufi:
+                    continue
+                if event.flight_ref and row.flight_ref and event.flight_ref != row.flight_ref:
+                    continue
+                raw_data = projection_raw_by_key_from_xml(event.raw_xml, projection_key) or {}
+                if raw_data:
+                    break
     if row is None:
         raise HTTPException(status_code=404, detail='TFMS projection not found')
     return TfmsProjectionResponse(
@@ -973,13 +1052,17 @@ async def get_tfms_projection(projection_key: str) -> TfmsProjectionResponse:
         msg_type=row.msg_type,
         source_facility=row.source_facility,
         source_timestamp=row.source_timestamp,
-        data=row.data,
+        data=(
+            raw_data
+            if raw and settings.tfms_raw_response_from_xml
+            else (only_raw_fields(row.data or {}) if raw else strip_raw_fields(row.data or {}))
+        ),
         updated_at=row.updated_at,
     )
 
 
 @app.get('/tbfm/events', response_model=list[TbfmEventResponse])
-async def list_tbfm_events(limit: int = 100) -> list[TbfmEventResponse]:
+async def list_tbfm_events(limit: int = 100, raw: bool = False) -> list[TbfmEventResponse]:
     async with TbfmAsyncSessionLocal() as session:
         rows = await get_tbfm_events(session, limit)
     return [
@@ -995,7 +1078,15 @@ async def list_tbfm_events(limit: int = 100) -> list[TbfmEventResponse]:
             gufi=row.gufi,
             tma_id=row.tma_id,
             source_time=row.source_time,
-            parsed_json=row.parsed_json,
+            parsed_json=(
+                (
+                    only_tbfm_raw_fields(parse_tbfm_xml(row.raw_xml))
+                    if settings.tbfm_raw_response_from_xml
+                    else only_tbfm_raw_fields(row.parsed_json or {})
+                )
+                if raw
+                else strip_tbfm_raw_fields(row.parsed_json or {})
+            ),
             created_at=row.created_at,
         )
         for row in rows
@@ -1003,9 +1094,32 @@ async def list_tbfm_events(limit: int = 100) -> list[TbfmEventResponse]:
 
 
 @app.get('/tbfm/projections', response_model=list[TbfmProjectionResponse])
-async def list_tbfm_projections(limit: int = 100) -> list[TbfmProjectionResponse]:
+async def list_tbfm_projections(limit: int = 100, raw: bool = False) -> list[TbfmProjectionResponse]:
     async with TbfmAsyncSessionLocal() as session:
         rows = await get_tbfm_projections(session, limit)
+        raw_by_key: dict[str, dict[str, Any]] = {}
+        if raw and rows and settings.tbfm_raw_response_from_xml:
+            candidates = await session.execute(
+                select(TbfmEvent).order_by(TbfmEvent.id.desc()).limit(max(limit * 5, 200))
+            )
+            recent_events = list(candidates.scalars())
+            for row in rows:
+                value: dict[str, Any] | None = None
+                for event in recent_events:
+                    if event.msg_type and row.msg_type and event.msg_type != row.msg_type:
+                        continue
+                    if event.acid and row.acid and event.acid != row.acid:
+                        continue
+                    if event.gufi and row.gufi and event.gufi != row.gufi:
+                        continue
+                    if event.flight_ref and row.flight_ref and event.flight_ref != row.flight_ref:
+                        continue
+                    if event.tma_id and row.tma_id and event.tma_id != row.tma_id:
+                        continue
+                    value = tbfm_projection_raw_by_key_from_xml(event.raw_xml, row.projection_key)
+                    if value:
+                        break
+                raw_by_key[row.projection_key] = value or {}
     return [
         TbfmProjectionResponse(
             projection_key=row.projection_key,
@@ -1017,7 +1131,11 @@ async def list_tbfm_projections(limit: int = 100) -> list[TbfmProjectionResponse
             msg_type=row.msg_type,
             source_facility=row.source_facility,
             source_time=row.source_time,
-            data=row.data,
+            data=(
+                raw_by_key.get(row.projection_key, {})
+                if raw and settings.tbfm_raw_response_from_xml
+                else (only_tbfm_raw_fields(row.data or {}) if raw else strip_tbfm_raw_fields(row.data or {}))
+            ),
             updated_at=row.updated_at,
         )
         for row in rows
@@ -1025,9 +1143,37 @@ async def list_tbfm_projections(limit: int = 100) -> list[TbfmProjectionResponse
 
 
 @app.get('/tbfm/projections/{projection_key}', response_model=TbfmProjectionResponse)
-async def get_tbfm_projection(projection_key: str) -> TbfmProjectionResponse:
+async def get_tbfm_projection(projection_key: str, raw: bool = False) -> TbfmProjectionResponse:
     async with TbfmAsyncSessionLocal() as session:
         row = await session.get(TbfmProjection, projection_key)
+        raw_data: dict[str, Any] = {}
+        if raw and row is not None and settings.tbfm_raw_response_from_xml:
+            stmt = select(TbfmEvent)
+            if row.msg_type:
+                stmt = stmt.where(TbfmEvent.msg_type == row.msg_type)
+            if row.acid:
+                stmt = stmt.where(TbfmEvent.acid == row.acid)
+            if row.gufi:
+                stmt = stmt.where(TbfmEvent.gufi == row.gufi)
+            if row.flight_ref:
+                stmt = stmt.where(TbfmEvent.flight_ref == row.flight_ref)
+            if row.tma_id:
+                stmt = stmt.where(TbfmEvent.tma_id == row.tma_id)
+            candidates = await session.execute(stmt.order_by(TbfmEvent.id.desc()).limit(5000))
+            for event in list(candidates.scalars()):
+                if event.msg_type and row.msg_type and event.msg_type != row.msg_type:
+                    continue
+                if event.acid and row.acid and event.acid != row.acid:
+                    continue
+                if event.gufi and row.gufi and event.gufi != row.gufi:
+                    continue
+                if event.flight_ref and row.flight_ref and event.flight_ref != row.flight_ref:
+                    continue
+                if event.tma_id and row.tma_id and event.tma_id != row.tma_id:
+                    continue
+                raw_data = tbfm_projection_raw_by_key_from_xml(event.raw_xml, projection_key) or {}
+                if raw_data:
+                    break
     if row is None:
         raise HTTPException(status_code=404, detail='TBFM projection not found')
     return TbfmProjectionResponse(
@@ -1040,7 +1186,11 @@ async def get_tbfm_projection(projection_key: str) -> TbfmProjectionResponse:
         msg_type=row.msg_type,
         source_facility=row.source_facility,
         source_time=row.source_time,
-        data=row.data,
+        data=(
+            raw_data
+            if raw and settings.tbfm_raw_response_from_xml
+            else (only_tbfm_raw_fields(row.data or {}) if raw else strip_tbfm_raw_fields(row.data or {}))
+        ),
         updated_at=row.updated_at,
     )
 
@@ -1053,6 +1203,15 @@ async def flights_websocket(websocket: WebSocket) -> None:
     gufi = websocket.query_params.get('gufi')
     destination = _normalize_destination_filter(websocket.query_params)
     airport = _normalize_airport_filter(websocket.query_params)
+    departure = _normalize_departure_filter(websocket.query_params)
+    limit_raw = websocket.query_params.get('limit')
+    limit = int(limit_raw) if isinstance(limit_raw, str) and limit_raw.isdigit() else 100
+    try:
+        date = _normalize_date_filter(websocket.query_params.get('date'))
+    except ValueError:
+        await websocket.send_json({'type': 'error', 'error': 'invalid_date', 'detail': 'Use YYYY-MM-DD'})
+        await websocket.close(code=1008)
+        return
 
     if callsign:
         callsign = callsign.upper()
@@ -1084,11 +1243,22 @@ async def flights_websocket(websocket: WebSocket) -> None:
             gufi=gufi,
             destination=destination,
             airport=airport,
+            departure=departure,
+            date=date,
+            limit=limit,
         )
     await websocket.send_json(
         {
             'type': 'snapshot',
-            'subscription': {'callsign': callsign, 'gufi': gufi, 'destination': destination, 'airport': airport},
+            'subscription': {
+                'callsign': callsign,
+                'gufi': gufi,
+                'destination': destination,
+                'airport': airport,
+                'departure': departure,
+                'date': date,
+                'limit': limit,
+            },
             'count': len(snapshot),
             'flights': snapshot,
         }
@@ -1103,6 +1273,14 @@ async def flights_websocket(websocket: WebSocket) -> None:
                     gufi = message.get('gufi')
                     destination = _normalize_destination_filter(message)
                     airport = _normalize_airport_filter(message)
+                    departure = _normalize_departure_filter(message)
+                    if isinstance(message.get('limit'), int) and message.get('limit') > 0:
+                        limit = int(message.get('limit'))
+                    try:
+                        date = _normalize_date_filter(message.get('date'))
+                    except ValueError:
+                        await websocket.send_json({'type': 'error', 'error': 'invalid_date', 'detail': 'Use YYYY-MM-DD'})
+                        continue
                     callsign = callsign.upper() if isinstance(callsign, str) and callsign else None
                     gufi = gufi if isinstance(gufi, str) and gufi else None
                     if message.get('snapshot', True):
@@ -1113,6 +1291,9 @@ async def flights_websocket(websocket: WebSocket) -> None:
                                 gufi=gufi,
                                 destination=destination,
                                 airport=airport,
+                                departure=departure,
+                                date=date,
+                                limit=limit,
                             )
                         await websocket.send_json(
                             {
@@ -1122,6 +1303,9 @@ async def flights_websocket(websocket: WebSocket) -> None:
                                     'gufi': gufi,
                                     'destination': destination,
                                     'airport': airport,
+                                    'departure': departure,
+                                    'date': date,
+                                    'limit': limit,
                                 },
                                 'count': len(snapshot),
                                 'flights': snapshot,
@@ -1136,6 +1320,9 @@ async def flights_websocket(websocket: WebSocket) -> None:
                                     'gufi': gufi,
                                     'destination': destination,
                                     'airport': airport,
+                                    'departure': departure,
+                                    'date': date,
+                                    'limit': limit,
                                 },
                             }
                         )
@@ -1189,6 +1376,8 @@ async def flights_websocket(websocket: WebSocket) -> None:
                     gufi=gufi,
                     destination=destination,
                     airport=airport,
+                    departure=departure,
+                    date=date,
                 )
                 if flights:
                     filtered_payload = _filter_sfdps_parsed_messages(
@@ -1197,6 +1386,8 @@ async def flights_websocket(websocket: WebSocket) -> None:
                         gufi=gufi,
                         destination=destination,
                         airport=airport,
+                        departure=departure,
+                        date=date,
                     )
                     filtered_event = dict(parsed_event)
                     if filtered_payload is not None:
@@ -1209,6 +1400,9 @@ async def flights_websocket(websocket: WebSocket) -> None:
                                 'gufi': gufi,
                                 'destination': destination,
                                 'airport': airport,
+                                'departure': departure,
+                                'date': date,
+                                'limit': limit,
                             },
                             'event': filtered_event,
                             'flights': flights,

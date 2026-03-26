@@ -63,6 +63,7 @@ services:
       CONSUMER_NAME: worker-1
       TFMS_QUEUE_NAME: ${TFMS_QUEUE_NAME}
       TFMS_PARSER_PATH: /tfms-app/tfms_parser.py
+      TFMS_RAW_RESPONSE_FROM_XML: ${TFMS_RAW_RESPONSE_FROM_XML:-true}
       TFMS_EVENTS_CHANNEL_NAME: tfms.events
       TFMS_PROJECTIONS_CHANNEL_NAME: tfms.projections
       TFMS_RAW_STREAM_NAME: ${TFMS_RAW_STREAM_NAME:-tfms.raw.xml}
@@ -72,6 +73,7 @@ services:
       TBFM_QUEUE_NAME: ${TBFM_QUEUE_NAME:-landgbnb.gmail.com.TBFM.3766a42b-c0b9-4848-9898-2e7bff589b66.OUT}
       TBFM_PARSER_PATH: /tbfm-app/tbfm_parser.py
       TBFM_PROJECTIONS_PATH: /tbfm-app/projections.py
+      TBFM_RAW_RESPONSE_FROM_XML: ${TBFM_RAW_RESPONSE_FROM_XML:-true}
       TBFM_EVENTS_CHANNEL_NAME: tbfm.events
       TBFM_PROJECTIONS_CHANNEL_NAME: tbfm.projections
       TBFM_RAW_STREAM_NAME: ${TBFM_RAW_STREAM_NAME:-tbfm.raw.xml}

@@ -11,17 +11,9 @@ from .config import settings
 from .redis_client import RedisManager
 from .tbfm_models import TbfmEvent, TbfmProjection
 from .tbfm_parser_adapter import build_tbfm_projections, parse_tbfm_xml
+from .tbfm_payload_utils import strip_raw_fields
 
 logger = logging.getLogger(__name__)
-
-
-def _strip_raw_fields(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {k: _strip_raw_fields(v) for k, v in value.items() if k != 'raw'}
-    if isinstance(value, list):
-        return [_strip_raw_fields(item) for item in value]
-    return value
-
 
 def _tbfm_summary(parsed: dict[str, Any]) -> tuple[str | None, str | None, str | None, str | None, str | None, str | None]:
     first_doc = ((parsed.get('documents') or [None])[0] or {}) if isinstance(parsed, dict) else {}
@@ -59,6 +51,8 @@ async def ingest_tbfm_xml(
     tma_attrs = (first_tma.get('attributes') or {}) if isinstance(first_tma, dict) else {}
     source_time = tma_attrs.get('msgTime') or env_attrs.get('envTime')
 
+    compact_parsed = strip_raw_fields(parsed)
+
     event = TbfmEvent(
         queue_name=queue_name or settings.tbfm_queue_name,
         payload_type='tbfm_metering_publication',
@@ -71,7 +65,7 @@ async def ingest_tbfm_xml(
         tma_id=tma_id,
         source_time=source_time,
         raw_xml=xml_text,
-        parsed_json=parsed,
+        parsed_json=compact_parsed,
     )
     session.add(event)
 
@@ -91,14 +85,13 @@ async def ingest_tbfm_xml(
         existing.msg_type = projection.get('msg_type')
         existing.source_facility = projection.get('source_facility')
         existing.source_time = projection.get('source_time')
-        existing.data = projection.get('data') or {}
+        existing.data = strip_raw_fields(projection.get('data') or {})
 
     await session.commit()
     await session.refresh(event)
 
     try:
         redis = await redis_manager.connect_tbfm()
-        compact_parsed = _strip_raw_fields(parsed)
         event_payload = {
             'event_id': event.id,
             'queue_name': event.queue_name,
@@ -119,7 +112,7 @@ async def ingest_tbfm_xml(
                 'msg_type': projection.get('msg_type'),
                 'source_facility': projection.get('source_facility'),
                 'source_time': projection.get('source_time'),
-                'data': _strip_raw_fields(projection.get('data') or {}),
+                'data': strip_raw_fields(projection.get('data') or {}),
             }
             await redis.publish(settings.tbfm_projections_channel_name, json.dumps(projection_payload, ensure_ascii=False))
     except Exception:
@@ -131,7 +124,7 @@ async def ingest_tbfm_xml(
         'payload_type': event.payload_type,
         'projection_count': len(projections),
         'queue_name': event.queue_name,
-        'parsed': parsed,
+        'parsed': compact_parsed,
     }
 
 

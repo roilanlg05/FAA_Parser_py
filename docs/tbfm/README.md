@@ -22,12 +22,22 @@ This repository runs TBFM in the same unified architecture used by SFDPS and TFM
 - `TBFM_SOLACE_VPN`
 - `TBFM_SOLACE_USERNAME`
 - `TBFM_SOLACE_PASSWORD`
+- `TBFM_RAW_RESPONSE_FROM_XML`
 
 ## API endpoints
 
 - `POST /ingest/tbfm/raw` (debug/manual injection only)
 - `GET /tbfm/ingest/stats`
-- `GET /tbfm/events`
-- `GET /tbfm/projections`
-- `GET /tbfm/projections/{projection_key}`
+- `GET /tbfm/events?raw=false`
+- `GET /tbfm/projections?raw=false`
+- `GET /tbfm/projections/{projection_key}?raw=false`
 - `WS /ws/tbfm`
+
+`raw=false` returns compact payloads; `raw=true` returns raw-only payloads.
+
+## Backfill (historical compacting)
+
+```bash
+docker compose exec -T fastapi python scripts/backfill_tbfm_compact_payloads.py --batch-size 500
+docker compose exec -T fastapi python scripts/backfill_tbfm_compact_payloads.py --batch-size 500 --max-batches 20
+```

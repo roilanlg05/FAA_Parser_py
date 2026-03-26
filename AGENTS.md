@@ -20,8 +20,12 @@ Instructions for coding agents working in this repository.
 - `python-app/app/tbfm_service.py`: TBFM persist + publish orchestration.
 - `python-app/app/tfms_parser_adapter.py`: TFMS parser adapter.
 - `python-app/app/tbfm_parser_adapter.py`: TBFM parser adapter.
+- `python-app/app/tfms_payload_utils.py`: TFMS raw/compact payload helpers.
+- `python-app/app/tbfm_payload_utils.py`: TBFM raw/compact payload helpers.
 - `python-app/tests/test_pipeline.py`: pytest tests.
 - `python-app/tests/tbfm/test_tbfm_parser.py`: TBFM parser tests.
+- `python-app/tests/tbfm/test_tbfm_payload_utils.py`: TBFM payload helper tests.
+- `python-app/scripts/sfdps_storage_maintenance.py`: SFDPS retention/archive maintenance.
 - `jms-bridge/pom.xml`: Maven build config (Java 17, shade plugin).
 - `jms-bridge/tfms/pom.xml`: Maven build config for TFMS bridge.
 - `jms-bridge/tbfm/pom.xml`: Maven build config for TBFM bridge.
@@ -67,6 +71,8 @@ Python tests are pytest-style functions in `python-app/tests/`.
 - Run one test file: `python -m pytest tests/test_pipeline.py`
 - Run one test function: `python -m pytest tests/test_pipeline.py::test_sfdps_projection`
 - Run by keyword: `python -m pytest -k sfdps`
+- Run TBFM payload tests: `python -m pytest tests/tbfm/test_tbfm_payload_utils.py -q`
+- Run SFDPS storage baseline script: `python scripts/sfdps_storage_maintenance.py baseline`
 - Fast single-test loop tip: use `file::test_name` and optionally `-q`.
 - Caveat: current tests read XML from absolute `/mnt/data/...` paths.
 - In clean environments, tests may fail unless those files exist.

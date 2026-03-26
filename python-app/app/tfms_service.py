@@ -11,17 +11,9 @@ from .config import settings
 from .redis_client import RedisManager
 from .tfms_models import TfmsEvent, TfmsProjection
 from .tfms_parser_adapter import build_tfms_projections, parse_tfms_xml
+from .tfms_payload_utils import strip_raw_fields
 
 logger = logging.getLogger(__name__)
-
-
-def _strip_raw_fields(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {k: _strip_raw_fields(v) for k, v in value.items() if k != 'raw'}
-    if isinstance(value, list):
-        return [_strip_raw_fields(item) for item in value]
-    return value
-
 
 def _root_facility_and_msg(parsed: dict[str, Any]) -> tuple[str | None, str | None, str | None, str | None]:
     payload_type = parsed.get('payload_type')
@@ -64,6 +56,8 @@ async def ingest_tfms_xml(
     projections = build_tfms_projections(parsed)
     gufi = projections[0].get('gufi') if projections else None
 
+    compact_parsed = strip_raw_fields(parsed)
+
     event = TfmsEvent(
         queue_name=queue_name or settings.tfms_queue_name,
         payload_type=parsed.get('payload_type') or 'unknown',
@@ -74,7 +68,7 @@ async def ingest_tfms_xml(
         acid=acid,
         gufi=gufi,
         raw_xml=xml_text,
-        parsed_json=parsed,
+        parsed_json=compact_parsed,
     )
     session.add(event)
 
@@ -93,14 +87,13 @@ async def ingest_tfms_xml(
         existing.msg_type = projection.get('msgType')
         existing.source_facility = projection.get('sourceFacility')
         existing.source_timestamp = projection.get('sourceTimeStamp')
-        existing.data = projection.get('data') or {}
+        existing.data = strip_raw_fields(projection.get('data') or {})
 
     await session.commit()
     await session.refresh(event)
 
     try:
         redis = await redis_manager.connect_tfms()
-        compact_parsed = _strip_raw_fields(parsed)
         event_payload = {
             'event_id': event.id,
             'queue_name': event.queue_name,
@@ -121,7 +114,7 @@ async def ingest_tfms_xml(
                 'msg_type': projection.get('msgType'),
                 'source_facility': projection.get('sourceFacility'),
                 'source_timestamp': projection.get('sourceTimeStamp'),
-                'data': _strip_raw_fields(data),
+                'data': strip_raw_fields(data),
             }
             await redis.publish(settings.tfms_projections_channel_name, json.dumps(projection_payload, ensure_ascii=False))
     except Exception:
@@ -133,7 +126,7 @@ async def ingest_tfms_xml(
         'payload_type': event.payload_type,
         'projection_count': len(projections),
         'queue_name': event.queue_name,
-        'parsed': parsed,
+        'parsed': compact_parsed,
     }
 
 

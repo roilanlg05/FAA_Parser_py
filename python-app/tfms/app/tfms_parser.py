@@ -199,6 +199,35 @@ def indexed_children(parent: Optional[ET.Element]) -> Dict[str, List[ET.Element]
     return out
 
 
+def parse_xml_node(elem: Optional[ET.Element]) -> Any:
+    if elem is None:
+        return None
+
+    attrs = strip_ns_dict(dict(elem.attrib))
+    groups = indexed_children(elem)
+    text = text_of(elem)
+
+    if not groups:
+        if attrs:
+            out: Dict[str, Any] = {"attributes": attrs}
+            if text is not None:
+                out["value"] = text
+            return out
+        return text
+
+    out: Dict[str, Any] = {}
+    if attrs:
+        out["attributes"] = attrs
+    if text is not None:
+        out["text"] = text
+
+    for name, elems in groups.items():
+        values = [parse_xml_node(x) for x in elems]
+        out[name] = values[0] if len(values) == 1 else values
+
+    return out
+
+
 # ------------------------------------------------------------
 # TFMS known blocks
 # ------------------------------------------------------------
@@ -423,6 +452,199 @@ def parse_aircraft_specification(elem: Optional[ET.Element]) -> Optional[Dict[st
     }
 
 
+def parse_speed(elem: Optional[ET.Element]) -> Optional[Dict[str, Any]]:
+    if elem is None:
+        return None
+
+    attrs = strip_ns_dict(dict(elem.attrib))
+    out: Dict[str, Any] = {
+        "attributes": attrs,
+        "value": text_of(elem),
+        "filedTrueAirSpeed": to_int(text_of(child(elem, "filedTrueAirSpeed"))),
+        "raw": element_to_lossless_json(elem),
+    }
+    extras: Dict[str, Any] = {}
+    for name, elems in indexed_children(elem).items():
+        if name == "filedTrueAirSpeed":
+            continue
+        values = [parse_xml_node(x) for x in elems]
+        extras[name] = values[0] if len(values) == 1 else values
+    if extras:
+        out["extras"] = extras
+    return out
+
+
+def parse_altitude(elem: Optional[ET.Element]) -> Optional[Dict[str, Any]]:
+    if elem is None:
+        return None
+
+    attrs = strip_ns_dict(dict(elem.attrib))
+    out: Dict[str, Any] = {
+        "attributes": attrs,
+        "value": text_of(elem),
+        "simpleAltitude": parse_simple_altitude_text(text_of(child(elem, "simpleAltitude"))),
+        "raw": element_to_lossless_json(elem),
+    }
+    extras: Dict[str, Any] = {}
+    for name, elems in indexed_children(elem).items():
+        if name == "simpleAltitude":
+            continue
+        values = [parse_xml_node(x) for x in elems]
+        extras[name] = values[0] if len(values) == 1 else values
+    if extras:
+        out["extras"] = extras
+    return out
+
+
+def parse_position_data(elem: Optional[ET.Element]) -> Optional[Dict[str, Any]]:
+    if elem is None:
+        return None
+
+    out: Dict[str, Any] = {
+        "position": parse_position_dms(child(elem, "position")),
+        "altitude": parse_altitude(child(elem, "altitude")),
+        "time": text_of(child(elem, "time")),
+        "extras": {},
+        "raw": element_to_lossless_json(elem),
+    }
+
+    known = {"position", "altitude", "time"}
+    for name, elems in indexed_children(elem).items():
+        if name not in known:
+            values = [parse_xml_node(x) for x in elems]
+            out["extras"][name] = values[0] if len(values) == 1 else values
+
+    return out
+
+
+def parse_amendment_data(elem: Optional[ET.Element]) -> Optional[Dict[str, Any]]:
+    if elem is None:
+        return None
+
+    out: Dict[str, Any] = {
+        "newFlightAircraftSpecs": parse_aircraft_specification(child(elem, "newFlightAircraftSpecs")),
+        "newRouteOfFlight": text_of(child(elem, "newRouteOfFlight")),
+        "newCoordinationPoint": text_of(child(elem, "newCoordinationPoint")),
+        "newCoordinationTime": text_of(child(elem, "newCoordinationTime")),
+        "newSpeed": parse_speed(child(elem, "newSpeed")),
+        "newAltitude": parse_altitude(child(elem, "newAltitude")),
+        "extras": {},
+        "raw": element_to_lossless_json(elem),
+    }
+
+    known = {
+        "newFlightAircraftSpecs",
+        "newRouteOfFlight",
+        "newCoordinationPoint",
+        "newCoordinationTime",
+        "newSpeed",
+        "newAltitude",
+    }
+    for name, elems in indexed_children(elem).items():
+        if name not in known:
+            values = [parse_xml_node(x) for x in elems]
+            out["extras"][name] = values[0] if len(values) == 1 else values
+
+    return out
+
+
+def parse_diversion_cancel_data(elem: Optional[ET.Element]) -> Optional[Dict[str, Any]]:
+    if elem is None:
+        return None
+
+    out: Dict[str, Any] = {
+        "canceledFlightReference": text_of(child(elem, "canceledFlightReference")),
+        "newFlightReference": text_of(child(elem, "newFlightReference")),
+        "extras": {},
+        "raw": element_to_lossless_json(elem),
+    }
+
+    known = {"canceledFlightReference", "newFlightReference"}
+    for name, elems in indexed_children(elem).items():
+        if name not in known:
+            values = [parse_xml_node(x) for x in elems]
+            out["extras"][name] = values[0] if len(values) == 1 else values
+
+    return out
+
+
+def parse_generic_flight_body(elem: Optional[ET.Element]) -> Optional[Dict[str, Any]]:
+    if elem is None:
+        return None
+
+    groups = indexed_children(elem)
+    out: Dict[str, Any] = {
+        "tag": local_name(elem.tag),
+        "qualifiedAircraftId": parse_qualified_aircraft_id(child(elem, "qualifiedAircraftId")),
+        "flightStatusAndSpec": parse_flight_status_and_spec(child(elem, "flightStatusAndSpec")),
+        "flightAircraftSpecs": parse_aircraft_specification(child(elem, "flightAircraftSpecs")),
+        "airlineData": parse_airline_data(child(elem, "airlineData")),
+        "flightTimeData": parse_flight_time_data(child(elem, "flightTimeData")),
+        "ncsmFlightTimeData": parse_flight_time_data(child(elem, "ncsmFlightTimeData")),
+        "ncsmTrackData": parse_track_or_route_data(child(elem, "ncsmTrackData")),
+        "ncsmRouteData": parse_track_or_route_data(child(elem, "ncsmRouteData")),
+        "flightTraversalData2": parse_flight_traversal_data2(child(elem, "flightTraversalData2")),
+        "arrivalFixAndTime": [parse_arrival_or_departure_fix_time(x) for x in groups.get("arrivalFixAndTime", [])],
+        "departureFixAndTime": [parse_arrival_or_departure_fix_time(x) for x in groups.get("departureFixAndTime", [])],
+        "plannedPositionData": parse_position_data(child(elem, "plannedPositionData")),
+        "reportedPositionData": parse_position_data(child(elem, "reportedPositionData")),
+        "position": parse_position_dms(child(elem, "position")),
+        "boundaryPosition": parse_position_dms(child(elem, "boundaryPosition")),
+        "reportedAltitude": parse_reported_altitude(child(elem, "reportedAltitude")),
+        "altitude": parse_altitude(child(elem, "altitude")),
+        "speed": parse_speed(child(elem, "speed")),
+        "amendmentData": parse_amendment_data(child(elem, "amendmentData")),
+        "diversionCancelData": parse_diversion_cancel_data(child(elem, "diversionCancelData")),
+        "newAircraftId": text_of(child(elem, "newAircraftId")),
+        "routeOfFlight": text_of(child(elem, "routeOfFlight")),
+        "coordinationPoint": text_of(child(elem, "coordinationPoint")),
+        "coordinationTime": text_of(child(elem, "coordinationTime")),
+        "timeOfDeparture": text_of(child(elem, "timeOfDeparture")),
+        "timeOfArrival": text_of(child(elem, "timeOfArrival")),
+        "timeAtPosition": text_of(child(elem, "timeAtPosition")),
+        "extras": {},
+        "raw": element_to_lossless_json(elem),
+    }
+
+    handled = {
+        "qualifiedAircraftId",
+        "flightStatusAndSpec",
+        "flightAircraftSpecs",
+        "airlineData",
+        "flightTimeData",
+        "ncsmFlightTimeData",
+        "ncsmTrackData",
+        "ncsmRouteData",
+        "flightTraversalData2",
+        "arrivalFixAndTime",
+        "departureFixAndTime",
+        "plannedPositionData",
+        "reportedPositionData",
+        "position",
+        "boundaryPosition",
+        "reportedAltitude",
+        "altitude",
+        "speed",
+        "amendmentData",
+        "diversionCancelData",
+        "newAircraftId",
+        "routeOfFlight",
+        "coordinationPoint",
+        "coordinationTime",
+        "timeOfDeparture",
+        "timeOfArrival",
+        "timeAtPosition",
+    }
+
+    for name, elems in groups.items():
+        if name in handled:
+            continue
+        values = [parse_xml_node(x) for x in elems]
+        out["extras"][name] = values[0] if len(values) == 1 else values
+
+    return out
+
+
 
 def parse_flight_status_and_spec(elem: Optional[ET.Element]) -> Optional[Dict[str, Any]]:
     if elem is None:
@@ -544,7 +766,7 @@ def parse_fltd_message(elem: ET.Element) -> Dict[str, Any]:
         parsed["body"] = parse_flight_times(child(elem, "ncsmFlightTimes"))
     else:
         first = first_child(elem)
-        parsed["body"] = element_to_lossless_json(first) if first is not None else None
+        parsed["body"] = parse_generic_flight_body(first)
     return parsed
 
 
@@ -563,6 +785,19 @@ def parse_fltd_output(elem: ET.Element) -> Dict[str, Any]:
 def parse_name_value_elem(elem: ET.Element) -> Dict[str, Any]:
     attrs = strip_ns_dict(dict(elem.attrib))
     return {"attributes": attrs, "text": text_of(elem), "raw": element_to_lossless_json(elem)}
+
+
+def parse_generic_fi_block(elem: Optional[ET.Element]) -> Optional[Dict[str, Any]]:
+    if elem is None:
+        return None
+    parsed = parse_xml_node(elem)
+    if isinstance(parsed, dict):
+        out = dict(parsed)
+    else:
+        out = {"value": parsed}
+    out["tag"] = local_name(elem.tag)
+    out["raw"] = element_to_lossless_json(elem)
+    return out
 
 
 def parse_restriction_message(elem: Optional[ET.Element]) -> Optional[Dict[str, Any]]:
@@ -743,6 +978,12 @@ def parse_fi_message(elem: ET.Element) -> Dict[str, Any]:
     attrs = strip_ns_dict(dict(elem.attrib))
     all_flight_data = children(child(elem, "tmiFlightDataList"), "flightData")
     restriction_message = parse_restriction_message(child(elem, "restrictionMessage"))
+    general_advisories = [parse_generic_fi_block(x) for x in children(elem, "generalAdvisory")]
+    airport_config_messages = [parse_generic_fi_block(x) for x in children(elem, "airportConfigMessage")]
+    fea_fca = [parse_generic_fi_block(x) for x in children(elem, "feaFca")]
+    rapt_timeline_messages = [parse_generic_fi_block(x) for x in children(elem, "raptTimelineMessage")]
+    gdp_cancels = [parse_generic_fi_block(x) for x in children(elem, "gdpCancel")]
+    cdm_update_data = [parse_generic_fi_block(x) for x in children(elem, "cdmUpdateData")]
     return {
         "attributes": attrs,
         "msgType": attrs.get("msgType"),
@@ -752,10 +993,32 @@ def parse_fi_message(elem: ET.Element) -> Dict[str, Any]:
         "tmiFlightDataList": [parse_tmi_flight_data(x) for x in all_flight_data],
         "restrictionMessage": restriction_message,
         "restrictionCount": 1 if restriction_message else 0,
+        "generalAdvisories": general_advisories,
+        "generalAdvisoryCount": len(general_advisories),
+        "airportConfigMessages": airport_config_messages,
+        "airportConfigCount": len(airport_config_messages),
+        "feaFca": fea_fca,
+        "feaFcaCount": len(fea_fca),
+        "raptTimelineMessages": rapt_timeline_messages,
+        "raptTimelineCount": len(rapt_timeline_messages),
+        "gdpCancels": gdp_cancels,
+        "gdpCancelCount": len(gdp_cancels),
+        "cdmUpdateData": cdm_update_data,
+        "cdmUpdateCount": len(cdm_update_data),
         "extras": {
             name: [element_to_lossless_json(x) for x in elems]
             for name, elems in indexed_children(elem).items()
-            if name not in {"tmiFlightDataList", "restrictionMessage"}
+            if name
+            not in {
+                "tmiFlightDataList",
+                "restrictionMessage",
+                "generalAdvisory",
+                "airportConfigMessage",
+                "feaFca",
+                "raptTimelineMessage",
+                "gdpCancel",
+                "cdmUpdateData",
+            }
         },
         "raw": element_to_lossless_json(elem),
     }
@@ -845,6 +1108,12 @@ def parse_tfms_xml(xml_text: Union[str, bytes]) -> Dict[str, Any]:
 def projection_key_for_message(message: Dict[str, Any]) -> str:
     body = message.get("body") or {}
     qid = body.get("qualifiedAircraftId") if isinstance(body, dict) else None
+    if not isinstance(qid, dict) and isinstance(body, dict):
+        airline_data = body.get("airlineData")
+        if isinstance(airline_data, dict):
+            nested_qid = airline_data.get("qualifiedAircraftId")
+            if isinstance(nested_qid, dict):
+                qid = nested_qid
     gufi = qid.get("gufi") if isinstance(qid, dict) else None
     acid = message.get("acid") or (qid.get("aircraftId") if isinstance(qid, dict) else None)
     flight_ref = message.get("flightRef")
@@ -856,10 +1125,21 @@ def build_projections(parsed_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     payload_type = parsed_payload.get("payload_type")
     projections: List[Dict[str, Any]] = []
 
+    def _flow_key(prefix: str, *parts: Any) -> str:
+        clean = [str(part) for part in parts if part not in (None, "")]
+        suffix = "|".join(clean) if clean else "unknown"
+        return f"{prefix}:{suffix}"
+
     if payload_type == "tfms_flight_data_output":
         for message in parsed_payload.get("messages", []):
             body = message.get("body") or {}
             qid = body.get("qualifiedAircraftId") if isinstance(body, dict) else None
+            if not isinstance(qid, dict) and isinstance(body, dict):
+                airline_data = body.get("airlineData")
+                if isinstance(airline_data, dict):
+                    nested_qid = airline_data.get("qualifiedAircraftId")
+                    if isinstance(nested_qid, dict):
+                        qid = nested_qid
             projections.append(
                 {
                     "projection_type": "flight_message",
@@ -915,6 +1195,138 @@ def build_projections(parsed_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "sourceFacility": message.get("sourceFacility"),
                         "sourceTimeStamp": message.get("sourceTimeStamp"),
                         "data": flight_data,
+                    }
+                )
+
+            for advisory in message.get("generalAdvisories", []):
+                if not isinstance(advisory, dict):
+                    continue
+                key = _flow_key(
+                    "gadv",
+                    advisory.get("advisoryNumber"),
+                    advisory.get("origin") or message.get("sourceFacility"),
+                )
+                projections.append(
+                    {
+                        "projection_type": "general_advisory",
+                        "key": key,
+                        "acid": None,
+                        "gufi": None,
+                        "flightRef": None,
+                        "msgType": message.get("msgType"),
+                        "sourceFacility": message.get("sourceFacility"),
+                        "sourceTimeStamp": message.get("sourceTimeStamp"),
+                        "data": advisory,
+                    }
+                )
+
+            for config in message.get("airportConfigMessages", []):
+                if not isinstance(config, dict):
+                    continue
+                key = _flow_key(
+                    "aptc",
+                    config.get("airport"),
+                    config.get("facility") or message.get("sourceFacility"),
+                )
+                projections.append(
+                    {
+                        "projection_type": "airport_config",
+                        "key": key,
+                        "acid": None,
+                        "gufi": None,
+                        "flightRef": None,
+                        "msgType": message.get("msgType"),
+                        "sourceFacility": message.get("sourceFacility"),
+                        "sourceTimeStamp": message.get("sourceTimeStamp"),
+                        "data": config,
+                    }
+                )
+
+            for fca in message.get("feaFca", []):
+                if not isinstance(fca, dict):
+                    continue
+                key = _flow_key("fea_fca", fca.get("fcaId") or fca.get("fcaName"), message.get("sourceFacility"))
+                projections.append(
+                    {
+                        "projection_type": "fea_fca",
+                        "key": key,
+                        "acid": None,
+                        "gufi": None,
+                        "flightRef": None,
+                        "msgType": message.get("msgType"),
+                        "sourceFacility": message.get("sourceFacility"),
+                        "sourceTimeStamp": message.get("sourceTimeStamp"),
+                        "data": fca,
+                    }
+                )
+
+            for index, rapt in enumerate(message.get("raptTimelineMessages", []), start=1):
+                if not isinstance(rapt, dict):
+                    continue
+                key = _flow_key(
+                    "rapt",
+                    message.get("sourceFacility"),
+                    message.get("sourceTimeStamp"),
+                    index,
+                )
+                projections.append(
+                    {
+                        "projection_type": "rapt_timeline",
+                        "key": key,
+                        "acid": None,
+                        "gufi": None,
+                        "flightRef": None,
+                        "msgType": message.get("msgType"),
+                        "sourceFacility": message.get("sourceFacility"),
+                        "sourceTimeStamp": message.get("sourceTimeStamp"),
+                        "data": rapt,
+                    }
+                )
+
+            for index, gdp in enumerate(message.get("gdpCancels", []), start=1):
+                if not isinstance(gdp, dict):
+                    continue
+                key = _flow_key(
+                    "gdp_cancel",
+                    gdp.get("airportId"),
+                    gdp.get("center") or message.get("sourceFacility"),
+                    gdp.get("adlTime") or message.get("sourceTimeStamp"),
+                    index,
+                )
+                projections.append(
+                    {
+                        "projection_type": "gdp_cancel",
+                        "key": key,
+                        "acid": None,
+                        "gufi": None,
+                        "flightRef": None,
+                        "msgType": message.get("msgType"),
+                        "sourceFacility": message.get("sourceFacility"),
+                        "sourceTimeStamp": message.get("sourceTimeStamp"),
+                        "data": gdp,
+                    }
+                )
+
+            for index, cdm in enumerate(message.get("cdmUpdateData", []), start=1):
+                if not isinstance(cdm, dict):
+                    continue
+                key = _flow_key(
+                    "cdm_update",
+                    message.get("sourceFacility"),
+                    message.get("sourceTimeStamp"),
+                    index,
+                )
+                projections.append(
+                    {
+                        "projection_type": "cdm_update",
+                        "key": key,
+                        "acid": None,
+                        "gufi": None,
+                        "flightRef": None,
+                        "msgType": message.get("msgType"),
+                        "sourceFacility": message.get("sourceFacility"),
+                        "sourceTimeStamp": message.get("sourceTimeStamp"),
+                        "data": cdm,
                     }
                 )
         return projections

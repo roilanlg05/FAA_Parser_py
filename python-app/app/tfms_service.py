@@ -28,16 +28,36 @@ def _parse_source_timestamp(value: str | None) -> datetime | None:
 def _root_facility_and_msg(parsed: dict[str, Any]) -> tuple[str | None, str | None, str | None, str | None, datetime | None]:
     payload_type = parsed.get('payload_type')
     if payload_type == 'tfms_flight_data_output':
-        first = (parsed.get('messages') or [None])[0] or {}
-        body = first.get('body') or {}
-        qid = body.get('qualifiedAircraftId') or {}
-        return (
-            first.get('sourceFacility'),
-            first.get('msgType'),
-            first.get('flightRef'),
-            qid.get('aircraftId') or first.get('acid'),
-            _parse_source_timestamp(first.get('sourceTimeStamp')),
-        )
+        source_facility: str | None = None
+        msg_type: str | None = None
+        flight_ref: str | None = None
+        acid: str | None = None
+        source_timestamp: datetime | None = None
+
+        for message in parsed.get('messages') or []:
+            if not isinstance(message, dict):
+                continue
+
+            body = message.get('body') or {}
+            qid = body.get('qualifiedAircraftId') if isinstance(body, dict) else None
+            if not isinstance(qid, dict):
+                qid = {}
+
+            if source_facility is None:
+                source_facility = message.get('sourceFacility')
+            if msg_type is None:
+                msg_type = message.get('msgType')
+            if flight_ref is None:
+                flight_ref = message.get('flightRef')
+            if acid is None:
+                acid = qid.get('aircraftId') or message.get('acid')
+            if source_timestamp is None:
+                source_timestamp = _parse_source_timestamp(message.get('sourceTimeStamp'))
+
+            if source_facility and msg_type and flight_ref and acid and source_timestamp:
+                break
+
+        return (source_facility, msg_type, flight_ref, acid, source_timestamp)
     if payload_type == 'tfms_flow_information_output':
         first = (parsed.get('messages') or [None])[0] or {}
         tmi_first = (first.get('tmiFlightDataList') or [None])[0] or {}
@@ -51,7 +71,7 @@ def _root_facility_and_msg(parsed: dict[str, Any]) -> tuple[str | None, str | No
         )
     if payload_type == 'tfms_status_output':
         first = (parsed.get('statuses') or [None])[0] or {}
-        return (first.get('facility'), 'status', None, None, _parse_source_timestamp(first.get('timeStamp')))
+        return (first.get('facility'), 'status', None, None, _parse_source_timestamp(first.get('time')))
     return (None, None, None, None, None)
 
 
@@ -66,7 +86,7 @@ async def ingest_tfms_xml(
     parsed = parse_tfms_xml(xml_text)
     source_facility, msg_type, flight_ref, acid, source_timestamp = _root_facility_and_msg(parsed)
     projections = build_tfms_projections(parsed)
-    gufi = projections[0].get('gufi') if projections else None
+    gufi = next((projection.get('gufi') for projection in projections if projection.get('gufi')), None)
 
     compact_parsed = strip_raw_fields(parsed)
 

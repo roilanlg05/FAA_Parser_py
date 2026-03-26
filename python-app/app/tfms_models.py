@@ -25,6 +25,7 @@ class TfmsEvent(TfmsBase):
     flight_ref: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     acid: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     gufi: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    source_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     raw_xml: Mapped[str] = mapped_column(Text)
     parsed_json: Mapped[dict] = mapped_column(JSONType)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

@@ -77,13 +77,13 @@ PY
 - `GET /flights/current?limit=50`
 - `GET /flights/current/{gufi}`
 - `WS /ws/flights` (filtros: `callsign`, `gufi`, `airport`, `destination`, `departure`, `date`, `limit`)
-- `WS /ws/tfms` (filtro TFMS por `acid`, `gufi`, `msg_type`, etc.)
+- `WS /ws/tfms` (snapshot + realtime con filtros avanzados de identidad/estado/tiempo/aeropuerto)
 - `POST /ingest/tfms/raw` (debug/manual inject; pipeline productivo usa stream)
 - `GET /tfms/ingest/stats`
 - `GET /tfms/events?limit=100&raw=false`
 - `GET /tfms/projections?limit=100&raw=false`
 - `GET /tfms/projections/{projection_key}?raw=false`
-- `WS /ws/tbfm` (filtro TBFM por `acid`, `tma_id`, `msg_type`, etc.)
+- `WS /ws/tbfm` (snapshot + realtime con filtros avanzados de identidad/estado/tiempo/aeropuerto)
 - `POST /ingest/tbfm/raw` (debug/manual inject; pipeline productivo usa stream)
 - `GET /tbfm/ingest/stats`
 - `GET /tbfm/events?limit=100&raw=false`
@@ -150,6 +150,16 @@ Filtros soportados:
 - `projection_type`
 - `projection_key`
 - `queue_name`
+- `airport`
+- `departure`
+- `status`
+- `status_any`
+- `status_all`
+- `status_field` (`flight_status`, `tmi_status`, `service_state`)
+- `date`, `from_date`, `to_date` (`YYYY-MM-DD`)
+- `from_ts`, `to_ts` (ISO 8601)
+- `time_basis=source`
+- `limit` (1..500)
 
 Mensajes del servidor:
 
@@ -171,6 +181,8 @@ Ejemplos:
 curl -s "http://localhost:8000/tfms/events?limit=5&raw=false"
 curl -s "http://localhost:8000/tfms/events?limit=5&raw=true"
 curl -s "http://localhost:8000/tfms/projections?limit=5&raw=true"
+curl -s "http://localhost:8000/tfms/events?acid=NKS585&status_any=ARRIVED&time_basis=source"
+curl -s "http://localhost:8000/tfms/projections?airport=KJFK&from_date=2026-03-01&to_date=2026-03-31&sort=asc"
 ```
 
 Cambio de suscripcion en caliente:
@@ -181,9 +193,23 @@ Cambio de suscripcion en caliente:
   "acid": "NKS585",
   "msg_type": "FlightSectors",
   "source_facility": "TFMS",
+  "status_any": "ARRIVED,ACTIVE",
+  "airport": "KSDF",
+  "from_ts": "2026-03-26T00:00:00Z",
+  "to_ts": "2026-03-26T23:59:59Z",
+  "time_basis": "source",
+  "limit": 100,
   "snapshot": true
 }
 ```
+
+Filtros REST TFMS (`/tfms/events` y `/tfms/projections`):
+
+- Paginacion/orden: `limit`, `offset`, `sort=asc|desc`
+- Identidad: `acid|callsign`, `gufi`, `flight_ref`, `msg_type`, `source_facility`
+- Estado: `status`, `status_any`, `status_all`, `status_field`
+- Aeropuerto: `airport`, `departure`
+- Tiempo: `date`, `from_date`, `to_date`, `from_ts`, `to_ts`, `time_basis=source`
 
 ## WebSocket TBFM
 
@@ -205,6 +231,16 @@ Filtros soportados:
 - `projection_type`
 - `projection_key`
 - `queue_name`
+- `airport`
+- `departure`
+- `status`
+- `status_any`
+- `status_all`
+- `status_field` (`acs`, `fps`)
+- `date`, `from_date`, `to_date` (`YYYY-MM-DD`)
+- `from_ts`, `to_ts` (ISO 8601)
+- `time_basis=source`
+- `limit` (1..500)
 
 `WS /ws/tbfm` publica eventos compactos (sin ramas `raw`) para reducir latencia y consumo de memoria.
 
@@ -220,7 +256,17 @@ Ejemplos:
 curl -s "http://localhost:8000/tbfm/events?limit=5&raw=false"
 curl -s "http://localhost:8000/tbfm/events?limit=5&raw=true"
 curl -s "http://localhost:8000/tbfm/projections?limit=5&raw=true"
+curl -s "http://localhost:8000/tbfm/events?tma_id=DFW&status_field=acs&status_any=LANDED"
+curl -s "http://localhost:8000/tbfm/projections?airport=KATL&from_ts=2026-03-26T00:00:00Z&to_ts=2026-03-26T23:59:59Z"
 ```
+
+Filtros REST TBFM (`/tbfm/events` y `/tbfm/projections`):
+
+- Paginacion/orden: `limit`, `offset`, `sort=asc|desc`
+- Identidad: `acid|callsign`, `gufi`, `tma_id`, `flight_ref`, `msg_type`, `source_facility`, `queue_name`
+- Estado: `status`, `status_any`, `status_all`, `status_field`
+- Aeropuerto: `airport`, `departure`
+- Tiempo: `date`, `from_date`, `to_date`, `from_ts`, `to_ts`, `time_basis=source`
 
 ## Operacion diaria (runbook rapido)
 

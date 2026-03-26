@@ -22,6 +22,7 @@ class TfmsEventResponse(BaseModel):
     flight_ref: str | None = None
     acid: str | None = None
     gufi: str | None = None
+    source_timestamp: datetime | None = None
     parsed_json: dict[str, Any]
     created_at: datetime | None = None
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -15,7 +16,16 @@ from .tfms_payload_utils import strip_raw_fields
 
 logger = logging.getLogger(__name__)
 
-def _root_facility_and_msg(parsed: dict[str, Any]) -> tuple[str | None, str | None, str | None, str | None]:
+def _parse_source_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+
+
+def _root_facility_and_msg(parsed: dict[str, Any]) -> tuple[str | None, str | None, str | None, str | None, datetime | None]:
     payload_type = parsed.get('payload_type')
     if payload_type == 'tfms_flight_data_output':
         first = (parsed.get('messages') or [None])[0] or {}
@@ -26,6 +36,7 @@ def _root_facility_and_msg(parsed: dict[str, Any]) -> tuple[str | None, str | No
             first.get('msgType'),
             first.get('flightRef'),
             qid.get('aircraftId') or first.get('acid'),
+            _parse_source_timestamp(first.get('sourceTimeStamp')),
         )
     if payload_type == 'tfms_flow_information_output':
         first = (parsed.get('messages') or [None])[0] or {}
@@ -36,11 +47,12 @@ def _root_facility_and_msg(parsed: dict[str, Any]) -> tuple[str | None, str | No
             first.get('msgType'),
             tmi_first.get('flightReference'),
             flight.get('aircraftId'),
+            _parse_source_timestamp(first.get('sourceTimeStamp')),
         )
     if payload_type == 'tfms_status_output':
         first = (parsed.get('statuses') or [None])[0] or {}
-        return (first.get('facility'), 'status', None, None)
-    return (None, None, None, None)
+        return (first.get('facility'), 'status', None, None, _parse_source_timestamp(first.get('timeStamp')))
+    return (None, None, None, None, None)
 
 
 async def ingest_tfms_xml(
@@ -52,7 +64,7 @@ async def ingest_tfms_xml(
     metadata: dict[str, Any] | None,
 ) -> dict[str, Any]:
     parsed = parse_tfms_xml(xml_text)
-    source_facility, msg_type, flight_ref, acid = _root_facility_and_msg(parsed)
+    source_facility, msg_type, flight_ref, acid, source_timestamp = _root_facility_and_msg(parsed)
     projections = build_tfms_projections(parsed)
     gufi = projections[0].get('gufi') if projections else None
 
@@ -67,6 +79,7 @@ async def ingest_tfms_xml(
         flight_ref=flight_ref,
         acid=acid,
         gufi=gufi,
+        source_timestamp=source_timestamp,
         raw_xml=xml_text,
         parsed_json=compact_parsed,
     )

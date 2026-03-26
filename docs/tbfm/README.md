@@ -35,6 +35,28 @@ This repository runs TBFM in the same unified architecture used by SFDPS and TFM
 
 `raw=false` returns compact payloads; `raw=true` returns raw-only payloads.
 
+## Advanced filters
+
+Apply to `GET /tbfm/events` and `GET /tbfm/projections`:
+
+- Pagination/order: `limit`, `offset`, `sort=asc|desc`
+- Identity: `acid|callsign`, `gufi`, `tma_id`, `flight_ref`, `msg_type`, `source_facility`, `queue_name`
+- Status: `status`, `status_any`, `status_all`, `status_field`
+  - `status_field` values: `acs`, `fps`
+  - alias supported: `ARRIVED`
+- Airport: `airport`, `departure`
+- Time: `date`, `from_date`, `to_date`, `from_ts`, `to_ts`, `time_basis=source`
+
+Common validation errors:
+
+- `invalid_time_basis`
+- `invalid_status_field`
+- `invalid_sort`
+- `invalid_date_format`
+- `invalid_time_range`
+
+`WS /ws/tbfm` supports the same business filters (identity/status/airport/time) for initial subscription and `action=subscribe` updates.
+
 ## Backfill (historical compacting)
 
 ```bash

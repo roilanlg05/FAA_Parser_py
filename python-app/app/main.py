@@ -100,8 +100,13 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
     async with tfms_engine.begin() as conn:
         await conn.run_sync(TfmsBase.metadata.create_all)
+        await conn.execute(text('ALTER TABLE tfms_events ADD COLUMN IF NOT EXISTS source_timestamp TIMESTAMPTZ'))
+        await conn.execute(text('CREATE INDEX IF NOT EXISTS ix_tfms_events_source_timestamp ON tfms_events (source_timestamp)'))
+        await conn.execute(text('CREATE INDEX IF NOT EXISTS ix_tfms_projections_source_timestamp ON tfms_projections (source_timestamp)'))
     async with tbfm_engine.begin() as conn:
         await conn.run_sync(TbfmBase.metadata.create_all)
+        await conn.execute(text('CREATE INDEX IF NOT EXISTS ix_tbfm_events_source_time ON tbfm_events (source_time)'))
+        await conn.execute(text('CREATE INDEX IF NOT EXISTS ix_tbfm_projections_source_time ON tbfm_projections (source_time)'))
     await redis_manager.connect_sfdps()
     await redis_manager.connect_tfms()
     await redis_manager.connect_tbfm()
@@ -266,6 +271,256 @@ def _normalize_date_filter(value: Any) -> str | None:
     return datetime.strptime(value, '%Y-%m-%d').date().isoformat()
 
 
+def _split_csv_values(value: str | None, *, upper: bool = False) -> set[str]:
+    if not value:
+        return set()
+    items = [item.strip() for item in value.split(',') if item.strip()]
+    if upper:
+        return {item.upper() for item in items}
+    return set(items)
+
+
+def _parse_iso_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+
+
+def _matches_set(value: str | None, allowed: set[str], *, case_insensitive: bool = False) -> bool:
+    if not allowed:
+        return True
+    if value is None:
+        return False
+    if case_insensitive:
+        return value.upper() in {item.upper() for item in allowed}
+    return value in allowed
+
+
+def _validate_time_basis(value: str | None) -> None:
+    if value is None or value == 'source':
+        return
+    raise HTTPException(status_code=400, detail='invalid_time_basis')
+
+
+def _resolve_sort(value: str) -> bool:
+    normalized = value.lower()
+    if normalized == 'desc':
+        return True
+    if normalized == 'asc':
+        return False
+    raise HTTPException(status_code=400, detail='invalid_sort')
+
+
+def _resolve_time_bounds(
+    *,
+    date: str | None,
+    from_date: str | None,
+    to_date: str | None,
+    from_ts: str | None,
+    to_ts: str | None,
+) -> tuple[datetime | None, datetime | None]:
+    start: datetime | None = None
+    end: datetime | None = None
+
+    try:
+        if date:
+            base = datetime.strptime(date, '%Y-%m-%d').date()
+            start = datetime.combine(base, datetime.min.time()).astimezone()
+            end = datetime.combine(base, datetime.max.time()).astimezone()
+
+        if from_date:
+            d = datetime.strptime(from_date, '%Y-%m-%d').date()
+            start = datetime.combine(d, datetime.min.time()).astimezone()
+        if to_date:
+            d = datetime.strptime(to_date, '%Y-%m-%d').date()
+            end = datetime.combine(d, datetime.max.time()).astimezone()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail='invalid_date_format') from exc
+
+    ts_start = _parse_iso_timestamp(from_ts)
+    ts_end = _parse_iso_timestamp(to_ts)
+    if from_ts and ts_start is None:
+        raise HTTPException(status_code=400, detail='invalid_date_format')
+    if to_ts and ts_end is None:
+        raise HTTPException(status_code=400, detail='invalid_date_format')
+
+    if ts_start is not None:
+        start = ts_start
+    if ts_end is not None:
+        end = ts_end
+
+    if start and end and start > end:
+        raise HTTPException(status_code=400, detail='invalid_time_range')
+
+    return start, end
+
+
+TFMS_STATUS_FIELDS = {'flight_status', 'tmi_status', 'service_state'}
+TBFM_STATUS_FIELDS = {'acs', 'fps'}
+
+
+def _normalize_status_value(value: str) -> str:
+    return value.strip().upper()
+
+
+def _status_aliases(service: str, value: str) -> set[str]:
+    normalized = _normalize_status_value(value)
+    if normalized == 'ARRIVED':
+        return {'COMPLETED'} if service == 'tfms' else {'LANDED'}
+    return {normalized}
+
+
+def _status_targets(service: str, values: set[str]) -> set[str]:
+    targets: set[str] = set()
+    for value in values:
+        targets.update(_status_aliases(service, value))
+    return targets
+
+
+def _status_matches_any(current_values: list[str | None], targets: set[str]) -> bool:
+    if not targets:
+        return True
+    normalized_current = {_normalize_status_value(value) for value in current_values if isinstance(value, str) and value.strip()}
+    return bool(normalized_current.intersection(targets))
+
+
+def _status_matches_all(current_values: list[str | None], targets: set[str]) -> bool:
+    if not targets:
+        return True
+    normalized_current = {_normalize_status_value(value) for value in current_values if isinstance(value, str) and value.strip()}
+    return targets.issubset(normalized_current)
+
+
+def _paginate_list(items: list[Any], *, offset: int, limit: int) -> list[Any]:
+    if offset >= len(items):
+        return []
+    return items[offset : offset + limit]
+
+
+def _tfms_status_values_from_event_payload(payload: dict[str, Any]) -> dict[str, str | None]:
+    first_msg = (payload.get('messages') or [None])[0] if isinstance(payload, dict) else None
+    tmi_list = (first_msg or {}).get('tmiFlightDataList') if isinstance(first_msg, dict) else None
+    statuses_list = payload.get('statuses') if isinstance(payload, dict) else None
+    return {
+        'flight_status': (((first_msg or {}).get('body') or {}).get('flightStatus') if isinstance(first_msg, dict) else None),
+        'tmi_status': ((tmi_list or [{}])[0].get('status') if isinstance(tmi_list, list) and tmi_list else None),
+        'service_state': ((statuses_list or [{}])[0].get('state') if isinstance(statuses_list, list) and statuses_list else None),
+    }
+
+
+def _tfms_status_values_from_projection_data(data: dict[str, Any]) -> dict[str, str | None]:
+    body = data.get('body') if isinstance(data, dict) else None
+    tmi = data.get('tmi') if isinstance(data, dict) else None
+    status = data.get('status') if isinstance(data, dict) else None
+    return {
+        'flight_status': body.get('flightStatus') if isinstance(body, dict) else None,
+        'tmi_status': tmi.get('status') if isinstance(tmi, dict) else None,
+        'service_state': status.get('state') if isinstance(status, dict) else None,
+    }
+
+
+def _tbfm_status_values_from_payload(payload: dict[str, Any]) -> dict[str, str | None]:
+    documents = payload.get('documents') if isinstance(payload, dict) else None
+    first_doc = (documents or [None])[0] if isinstance(documents, list) and documents else None
+    first_tma = (((first_doc or {}).get('tma') or [None])[0] if isinstance(first_doc, dict) else None)
+    first_air = (((first_tma or {}).get('air') or [None])[0] if isinstance(first_tma, dict) else None)
+    first_flt = (first_air.get('flt') if isinstance(first_air, dict) else None) or {}
+    return {
+        'acs': first_flt.get('acs') if isinstance(first_flt, dict) else None,
+        'fps': first_flt.get('fps') if isinstance(first_flt, dict) else None,
+    }
+
+
+def _tbfm_status_values_from_projection_data(data: dict[str, Any]) -> dict[str, str | None]:
+    air = data.get('air') if isinstance(data, dict) else None
+    flt = air.get('flt') if isinstance(air, dict) else None
+    return {
+        'acs': flt.get('acs') if isinstance(flt, dict) else None,
+        'fps': flt.get('fps') if isinstance(flt, dict) else None,
+    }
+
+
+def _tfms_event_airports(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    first_msg = (payload.get('messages') or [None])[0] if isinstance(payload, dict) else None
+    body = first_msg.get('body') if isinstance(first_msg, dict) else None
+    qid = body.get('qualifiedAircraftId') if isinstance(body, dict) else None
+    dep = ((qid.get('departurePoint') or {}).get('airport')) if isinstance(qid, dict) else None
+    arr = ((qid.get('arrivalPoint') or {}).get('airport')) if isinstance(qid, dict) else None
+    return dep, arr
+
+
+def _tbfm_event_airports(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    documents = payload.get('documents') if isinstance(payload, dict) else None
+    first_doc = (documents or [None])[0] if isinstance(documents, list) and documents else None
+    first_tma = (((first_doc or {}).get('tma') or [None])[0] if isinstance(first_doc, dict) else None)
+    first_air = (((first_tma or {}).get('air') or [None])[0] if isinstance(first_tma, dict) else None)
+    first_flt = (first_air.get('flt') if isinstance(first_air, dict) else None) or {}
+    dep = first_flt.get('dap') if isinstance(first_flt, dict) else None
+    arr = first_flt.get('apt') if isinstance(first_flt, dict) else None
+    return dep, arr
+
+
+def _tfms_event_source_timestamp(payload: dict[str, Any]) -> datetime | None:
+    first_msg = (payload.get('messages') or [None])[0] if isinstance(payload, dict) else None
+    if isinstance(first_msg, dict):
+        ts = _parse_iso_timestamp(first_msg.get('sourceTimeStamp'))
+        if ts is not None:
+            return ts
+    statuses = payload.get('statuses') if isinstance(payload, dict) else None
+    first_status = (statuses or [None])[0] if isinstance(statuses, list) and statuses else None
+    if isinstance(first_status, dict):
+        return _parse_iso_timestamp(first_status.get('timeStamp'))
+    return None
+
+
+def _tbfm_event_source_timestamp(payload: dict[str, Any]) -> datetime | None:
+    documents = payload.get('documents') if isinstance(payload, dict) else None
+    first_doc = (documents or [None])[0] if isinstance(documents, list) and documents else None
+    attrs = (first_doc.get('attributes') if isinstance(first_doc, dict) else None) or {}
+    first_tma = (((first_doc or {}).get('tma') or [None])[0] if isinstance(first_doc, dict) else None)
+    tma_attrs = (first_tma.get('attributes') if isinstance(first_tma, dict) else None) or {}
+    return _parse_iso_timestamp(tma_attrs.get('msgTime') or attrs.get('envTime'))
+
+
+def _airport_matches(*, departure_airport: str | None, arrival_airport: str | None, departure_values: set[str], airport_values: set[str]) -> bool:
+    if departure_values and not _matches_set(departure_airport, departure_values, case_insensitive=True):
+        return False
+    if airport_values and not (
+        _matches_set(departure_airport, airport_values, case_insensitive=True)
+        or _matches_set(arrival_airport, airport_values, case_insensitive=True)
+    ):
+        return False
+    return True
+
+
+def _extract_tfms_projection_airports(data: dict[str, Any]) -> tuple[str | None, str | None]:
+    body = data.get('body') if isinstance(data, dict) else None
+    qid = body.get('qualifiedAircraftId') if isinstance(body, dict) else None
+    if isinstance(qid, dict):
+        dep = ((qid.get('departurePoint') or {}).get('airport')) if isinstance(qid.get('departurePoint'), dict) else None
+        arr = ((qid.get('arrivalPoint') or {}).get('airport')) if isinstance(qid.get('arrivalPoint'), dict) else None
+        return dep, arr
+    flight = data.get('flight') if isinstance(data, dict) else None
+    if isinstance(flight, dict):
+        dep = ((flight.get('departurePoint') or {}).get('airport')) if isinstance(flight.get('departurePoint'), dict) else None
+        arr = ((flight.get('arrivalPoint') or {}).get('airport')) if isinstance(flight.get('arrivalPoint'), dict) else None
+        return dep, arr
+    return None, None
+
+
+def _extract_tbfm_projection_airports(data: dict[str, Any]) -> tuple[str | None, str | None]:
+    dep = data.get('origin') if isinstance(data, dict) else None
+    arr = data.get('destination') if isinstance(data, dict) else None
+    if dep is None:
+        dep = (((data.get('air') or {}).get('flt') or {}).get('dap')) if isinstance(data, dict) else None
+    if arr is None:
+        arr = (((data.get('air') or {}).get('flt') or {}).get('apt')) if isinstance(data, dict) else None
+    return dep, arr
+
+
 def _normalize_tfms_subscription(payload: dict[str, Any]) -> dict[str, Any]:
     def _upper(value: Any) -> str | None:
         if isinstance(value, str) and value:
@@ -287,6 +542,18 @@ def _normalize_tfms_subscription(payload: dict[str, Any]) -> dict[str, Any]:
         'projection_type': _upper(payload.get('projection_type')),
         'projection_key': _text(payload.get('projection_key')),
         'queue_name': _text(payload.get('queue_name')),
+        'airport': _upper(payload.get('airport')),
+        'departure': _upper(payload.get('departure')),
+        'status': _text(payload.get('status')),
+        'status_any': _text(payload.get('status_any')),
+        'status_all': _text(payload.get('status_all')),
+        'status_field': _text(payload.get('status_field')),
+        'date': _text(payload.get('date')),
+        'from_date': _text(payload.get('from_date')),
+        'to_date': _text(payload.get('to_date')),
+        'from_ts': _text(payload.get('from_ts')),
+        'to_ts': _text(payload.get('to_ts')),
+        'time_basis': _text(payload.get('time_basis')),
     }
 
 
@@ -312,6 +579,18 @@ def _normalize_tbfm_subscription(payload: dict[str, Any]) -> dict[str, Any]:
         'projection_type': _upper(payload.get('projection_type')),
         'projection_key': _text(payload.get('projection_key')),
         'queue_name': _text(payload.get('queue_name')),
+        'airport': _upper(payload.get('airport')),
+        'departure': _upper(payload.get('departure')),
+        'status': _text(payload.get('status')),
+        'status_any': _text(payload.get('status_any')),
+        'status_all': _text(payload.get('status_all')),
+        'status_field': _text(payload.get('status_field')),
+        'date': _text(payload.get('date')),
+        'from_date': _text(payload.get('from_date')),
+        'to_date': _text(payload.get('to_date')),
+        'from_ts': _text(payload.get('from_ts')),
+        'to_ts': _text(payload.get('to_ts')),
+        'time_basis': _text(payload.get('time_basis')),
     }
 
 
@@ -435,9 +714,141 @@ def _tbfm_matches_subscription(fields: dict[str, Any], subscription: dict[str, A
     )
 
 
+def _tfms_realtime_filters_match(payload: dict[str, Any], subscription: dict[str, Any], *, projection: bool) -> bool:
+    try:
+        _validate_time_basis(subscription.get('time_basis'))
+        start, end = _resolve_time_bounds(
+            date=subscription.get('date'),
+            from_date=subscription.get('from_date'),
+            to_date=subscription.get('to_date'),
+            from_ts=subscription.get('from_ts'),
+            to_ts=subscription.get('to_ts'),
+        )
+    except HTTPException:
+        return False
+
+    if subscription.get('status_field') and subscription.get('status_field') not in TFMS_STATUS_FIELDS:
+        return False
+
+    airport_values = _split_csv_values(subscription.get('airport'), upper=True)
+    departure_values = _split_csv_values(subscription.get('departure'), upper=True)
+    status_any_values = {
+        _normalize_status_value(v) for v in _split_csv_values(subscription.get('status_any') or subscription.get('status'))
+    }
+    status_all_values = {_normalize_status_value(v) for v in _split_csv_values(subscription.get('status_all'))}
+    any_targets = _status_targets('tfms', status_any_values)
+    all_targets = _status_targets('tfms', status_all_values)
+
+    if projection:
+        source_time = _parse_iso_timestamp(payload.get('source_timestamp'))
+        data = payload.get('data') if isinstance(payload.get('data'), dict) else {}
+        statuses = _tfms_status_values_from_projection_data(data)
+        dep_airport, arr_airport = _extract_tfms_projection_airports(data)
+    else:
+        parsed = payload.get('parsed') if isinstance(payload.get('parsed'), dict) else {}
+        source_time = _tfms_event_source_timestamp(parsed)
+        statuses = _tfms_status_values_from_event_payload(parsed)
+        dep_airport, arr_airport = _tfms_event_airports(parsed)
+
+    if start is not None and (source_time is None or source_time < start):
+        return False
+    if end is not None and (source_time is None or source_time > end):
+        return False
+
+    fields = [subscription.get('status_field')] if subscription.get('status_field') else ['flight_status', 'tmi_status', 'service_state']
+    current_values = [statuses.get(field) for field in fields]
+    if any_targets and not _status_matches_any(current_values, any_targets):
+        return False
+    if all_targets and not _status_matches_all(current_values, all_targets):
+        return False
+
+    return _airport_matches(
+        departure_airport=dep_airport,
+        arrival_airport=arr_airport,
+        departure_values=departure_values,
+        airport_values=airport_values,
+    )
+
+
+def _tbfm_realtime_filters_match(payload: dict[str, Any], subscription: dict[str, Any], *, projection: bool) -> bool:
+    try:
+        _validate_time_basis(subscription.get('time_basis'))
+        start, end = _resolve_time_bounds(
+            date=subscription.get('date'),
+            from_date=subscription.get('from_date'),
+            to_date=subscription.get('to_date'),
+            from_ts=subscription.get('from_ts'),
+            to_ts=subscription.get('to_ts'),
+        )
+    except HTTPException:
+        return False
+
+    if subscription.get('status_field') and subscription.get('status_field') not in TBFM_STATUS_FIELDS:
+        return False
+
+    airport_values = _split_csv_values(subscription.get('airport'), upper=True)
+    departure_values = _split_csv_values(subscription.get('departure'), upper=True)
+    status_any_values = {
+        _normalize_status_value(v) for v in _split_csv_values(subscription.get('status_any') or subscription.get('status'))
+    }
+    status_all_values = {_normalize_status_value(v) for v in _split_csv_values(subscription.get('status_all'))}
+    any_targets = _status_targets('tbfm', status_any_values)
+    all_targets = _status_targets('tbfm', status_all_values)
+
+    if projection:
+        source_time = _parse_iso_timestamp(payload.get('source_time'))
+        data = payload.get('data') if isinstance(payload.get('data'), dict) else {}
+        statuses = _tbfm_status_values_from_projection_data(data)
+        dep_airport, arr_airport = _extract_tbfm_projection_airports(data)
+    else:
+        parsed = payload.get('parsed') if isinstance(payload.get('parsed'), dict) else {}
+        source_time = _tbfm_event_source_timestamp(parsed)
+        statuses = _tbfm_status_values_from_payload(parsed)
+        dep_airport, arr_airport = _tbfm_event_airports(parsed)
+
+    if start is not None and (source_time is None or source_time < start):
+        return False
+    if end is not None and (source_time is None or source_time > end):
+        return False
+
+    fields = [subscription.get('status_field')] if subscription.get('status_field') else ['acs', 'fps']
+    current_values = [statuses.get(field) for field in fields]
+    if any_targets and not _status_matches_any(current_values, any_targets):
+        return False
+    if all_targets and not _status_matches_all(current_values, all_targets):
+        return False
+
+    return _airport_matches(
+        departure_airport=dep_airport,
+        arrival_airport=arr_airport,
+        departure_values=departure_values,
+        airport_values=airport_values,
+    )
+
+
 async def _fetch_tfms_snapshot(subscription: dict[str, Any], limit: int = 100) -> list[dict[str, Any]]:
     if subscription.get('payload_type') or subscription.get('queue_name'):
         return []
+
+    _validate_time_basis(subscription.get('time_basis'))
+    if subscription.get('status_field') and subscription.get('status_field') not in TFMS_STATUS_FIELDS:
+        raise HTTPException(status_code=400, detail='invalid_status_field')
+    start, end = _resolve_time_bounds(
+        date=subscription.get('date'),
+        from_date=subscription.get('from_date'),
+        to_date=subscription.get('to_date'),
+        from_ts=subscription.get('from_ts'),
+        to_ts=subscription.get('to_ts'),
+    )
+
+    airport_values = _split_csv_values(subscription.get('airport'), upper=True)
+    departure_values = _split_csv_values(subscription.get('departure'), upper=True)
+    status_any_values = {
+        _normalize_status_value(v) for v in _split_csv_values(subscription.get('status_any') or subscription.get('status'))
+    }
+    status_all_values = {_normalize_status_value(v) for v in _split_csv_values(subscription.get('status_all'))}
+    any_targets = _status_targets('tfms', status_any_values)
+    all_targets = _status_targets('tfms', status_all_values)
 
     stmt = select(TfmsProjection)
 
@@ -460,10 +871,42 @@ async def _fetch_tfms_snapshot(subscription: dict[str, Any], limit: int = 100) -
     if subscription.get('projection_key'):
         stmt = stmt.where(TfmsProjection.projection_key == subscription['projection_key'])
 
-    stmt = stmt.order_by(TfmsProjection.updated_at.desc()).limit(limit)
+    stmt = stmt.order_by(TfmsProjection.updated_at.desc())
 
     async with TfmsAsyncSessionLocal() as session:
         rows = list((await session.execute(stmt)).scalars())
+
+    filtered_rows: list[TfmsProjection] = []
+    for row in rows:
+        ts = _parse_iso_timestamp(row.source_timestamp)
+        if start is not None and (ts is None or ts < start):
+            continue
+        if end is not None and (ts is None or ts > end):
+            continue
+
+        data = row.data or {}
+        statuses = _tfms_status_values_from_projection_data(data)
+        fields = [subscription.get('status_field')] if subscription.get('status_field') else ['flight_status', 'tmi_status', 'service_state']
+        current_values = [statuses.get(field) for field in fields]
+        if any_targets and not _status_matches_any(current_values, any_targets):
+            continue
+        if all_targets and not _status_matches_all(current_values, all_targets):
+            continue
+
+        if airport_values or departure_values:
+            dep_airport, arr_airport = _extract_tfms_projection_airports(data)
+            if not _airport_matches(
+                departure_airport=dep_airport,
+                arrival_airport=arr_airport,
+                departure_values=departure_values,
+                airport_values=airport_values,
+            ):
+                continue
+
+        filtered_rows.append(row)
+
+    rows = filtered_rows[:limit]
+
     snapshot: list[dict[str, Any]] = []
     for row in rows:
         projection = {
@@ -485,6 +928,26 @@ async def _fetch_tfms_snapshot(subscription: dict[str, Any], limit: int = 100) -
 async def _fetch_tbfm_snapshot(subscription: dict[str, Any], limit: int = 100) -> list[dict[str, Any]]:
     if subscription.get('payload_type') or subscription.get('queue_name'):
         return []
+
+    _validate_time_basis(subscription.get('time_basis'))
+    if subscription.get('status_field') and subscription.get('status_field') not in TBFM_STATUS_FIELDS:
+        raise HTTPException(status_code=400, detail='invalid_status_field')
+    start, end = _resolve_time_bounds(
+        date=subscription.get('date'),
+        from_date=subscription.get('from_date'),
+        to_date=subscription.get('to_date'),
+        from_ts=subscription.get('from_ts'),
+        to_ts=subscription.get('to_ts'),
+    )
+
+    airport_values = _split_csv_values(subscription.get('airport'), upper=True)
+    departure_values = _split_csv_values(subscription.get('departure'), upper=True)
+    status_any_values = {
+        _normalize_status_value(v) for v in _split_csv_values(subscription.get('status_any') or subscription.get('status'))
+    }
+    status_all_values = {_normalize_status_value(v) for v in _split_csv_values(subscription.get('status_all'))}
+    any_targets = _status_targets('tbfm', status_any_values)
+    all_targets = _status_targets('tbfm', status_all_values)
 
     stmt = select(TbfmProjection)
 
@@ -509,10 +972,42 @@ async def _fetch_tbfm_snapshot(subscription: dict[str, Any], limit: int = 100) -
     if subscription.get('projection_key'):
         stmt = stmt.where(TbfmProjection.projection_key == subscription['projection_key'])
 
-    stmt = stmt.order_by(TbfmProjection.updated_at.desc()).limit(limit)
+    stmt = stmt.order_by(TbfmProjection.updated_at.desc())
 
     async with TbfmAsyncSessionLocal() as session:
         rows = list((await session.execute(stmt)).scalars())
+
+    filtered_rows: list[TbfmProjection] = []
+    for row in rows:
+        ts = _parse_iso_timestamp(row.source_time)
+        if start is not None and (ts is None or ts < start):
+            continue
+        if end is not None and (ts is None or ts > end):
+            continue
+
+        data = row.data or {}
+        statuses = _tbfm_status_values_from_projection_data(data)
+        fields = [subscription.get('status_field')] if subscription.get('status_field') else ['acs', 'fps']
+        current_values = [statuses.get(field) for field in fields]
+        if any_targets and not _status_matches_any(current_values, any_targets):
+            continue
+        if all_targets and not _status_matches_all(current_values, all_targets):
+            continue
+
+        if airport_values or departure_values:
+            dep_airport, arr_airport = _extract_tbfm_projection_airports(data)
+            if not _airport_matches(
+                departure_airport=dep_airport,
+                arrival_airport=arr_airport,
+                departure_values=departure_values,
+                airport_values=airport_values,
+            ):
+                continue
+
+        filtered_rows.append(row)
+
+    rows = filtered_rows[:limit]
+
     snapshot: list[dict[str, Any]] = []
     for row in rows:
         projection = {
@@ -938,39 +1433,242 @@ async def get_current_flight(gufi: str, session: AsyncSession = Depends(get_db_s
 
 
 @app.get('/tfms/events', response_model=list[TfmsEventResponse])
-async def list_tfms_events(limit: int = 100, raw: bool = False) -> list[TfmsEventResponse]:
+async def list_tfms_events(
+    limit: int = 100,
+    offset: int = 0,
+    sort: str = 'desc',
+    raw: bool = False,
+    acid: str | None = None,
+    callsign: str | None = None,
+    gufi: str | None = None,
+    flight_ref: str | None = None,
+    msg_type: str | None = None,
+    source_facility: str | None = None,
+    queue_name: str | None = None,
+    status: str | None = None,
+    status_any: str | None = None,
+    status_all: str | None = None,
+    status_field: str | None = None,
+    airport: str | None = None,
+    departure: str | None = None,
+    date: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    time_basis: str | None = None,
+) -> list[TfmsEventResponse]:
+    _validate_time_basis(time_basis)
+    start, end = _resolve_time_bounds(date=date, from_date=from_date, to_date=to_date, from_ts=from_ts, to_ts=to_ts)
+    acid_values = _split_csv_values(acid or callsign, upper=True)
+    gufi_values = _split_csv_values(gufi)
+    flight_ref_values = _split_csv_values(flight_ref)
+    msg_type_values = _split_csv_values(msg_type)
+    source_values = _split_csv_values(source_facility, upper=True)
+    queue_values = _split_csv_values(queue_name)
+    status_any_values = {_normalize_status_value(v) for v in _split_csv_values(status_any or status)}
+    status_all_values = {_normalize_status_value(v) for v in _split_csv_values(status_all)}
+    airport_values = _split_csv_values(airport, upper=True)
+    departure_values = _split_csv_values(departure, upper=True)
+
+    if status_field and status_field not in TFMS_STATUS_FIELDS:
+        raise HTTPException(status_code=400, detail='invalid_status_field')
+
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    direction_desc = _resolve_sort(sort)
+    any_targets = _status_targets('tfms', status_any_values)
+    all_targets = _status_targets('tfms', status_all_values)
+
     async with TfmsAsyncSessionLocal() as session:
-        rows = await get_tfms_events(session, limit)
-    return [
-        TfmsEventResponse(
-            id=row.id,
-            queue_name=row.queue_name,
-            payload_type=row.payload_type,
-            root_tag=row.root_tag,
-            source_facility=row.source_facility,
-            msg_type=row.msg_type,
-            flight_ref=row.flight_ref,
-            acid=row.acid,
-            gufi=row.gufi,
-            parsed_json=(
-                (
-                    only_raw_fields(parse_tfms_xml(row.raw_xml))
-                    if settings.tfms_raw_response_from_xml
-                    else only_raw_fields(row.parsed_json or {})
-                )
-                if raw
-                else strip_raw_fields(row.parsed_json or {})
-            ),
-            created_at=row.created_at,
+        stmt = select(TfmsEvent)
+        if acid_values:
+            stmt = stmt.where(func.upper(TfmsEvent.acid).in_(acid_values))
+        if gufi_values:
+            stmt = stmt.where(TfmsEvent.gufi.in_(gufi_values))
+        if flight_ref_values:
+            stmt = stmt.where(TfmsEvent.flight_ref.in_(flight_ref_values))
+        if msg_type_values:
+            stmt = stmt.where(func.lower(TfmsEvent.msg_type).in_({m.lower() for m in msg_type_values}))
+        if source_values:
+            stmt = stmt.where(func.upper(TfmsEvent.source_facility).in_(source_values))
+        if queue_values:
+            stmt = stmt.where(TfmsEvent.queue_name.in_(queue_values))
+        if start is not None:
+            stmt = stmt.where(TfmsEvent.source_timestamp >= start)
+        if end is not None:
+            stmt = stmt.where(TfmsEvent.source_timestamp <= end)
+        stmt = stmt.order_by(
+            TfmsEvent.source_timestamp.desc() if direction_desc else TfmsEvent.source_timestamp.asc(),
+            TfmsEvent.id.desc() if direction_desc else TfmsEvent.id.asc(),
         )
-        for row in rows
-    ]
+        rows = list((await session.execute(stmt)).scalars())
+
+    filtered_rows: list[TfmsEvent] = []
+    for row in rows:
+        payload = row.parsed_json or {}
+        statuses = _tfms_status_values_from_event_payload(payload)
+        fields = [status_field] if status_field else ['flight_status', 'tmi_status', 'service_state']
+        current_values = [statuses.get(field) for field in fields]
+        if any_targets and not _status_matches_any(current_values, any_targets):
+            continue
+        if all_targets and not _status_matches_all(current_values, all_targets):
+            continue
+
+        if airport_values or departure_values:
+            dep_airport, arr_airport = _tfms_event_airports(payload)
+            if not _airport_matches(
+                departure_airport=dep_airport,
+                arrival_airport=arr_airport,
+                departure_values=departure_values,
+                airport_values=airport_values,
+            ):
+                continue
+
+        filtered_rows.append(row)
+
+    rows = _paginate_list(filtered_rows, offset=offset, limit=limit)
+
+    output: list[TfmsEventResponse] = []
+    for row in rows:
+        output.append(
+            TfmsEventResponse(
+                id=row.id,
+                queue_name=row.queue_name,
+                payload_type=row.payload_type,
+                root_tag=row.root_tag,
+                source_facility=row.source_facility,
+                msg_type=row.msg_type,
+                flight_ref=row.flight_ref,
+                acid=row.acid,
+                gufi=row.gufi,
+                source_timestamp=row.source_timestamp,
+                parsed_json=(
+                    (
+                        only_raw_fields(parse_tfms_xml(row.raw_xml))
+                        if settings.tfms_raw_response_from_xml
+                        else only_raw_fields(row.parsed_json or {})
+                    )
+                    if raw
+                    else strip_raw_fields(row.parsed_json or {})
+                ),
+                created_at=row.created_at,
+            )
+        )
+    return output
 
 
 @app.get('/tfms/projections', response_model=list[TfmsProjectionResponse])
-async def list_tfms_projections(limit: int = 100, raw: bool = False) -> list[TfmsProjectionResponse]:
+async def list_tfms_projections(
+    limit: int = 100,
+    offset: int = 0,
+    sort: str = 'desc',
+    raw: bool = False,
+    acid: str | None = None,
+    callsign: str | None = None,
+    gufi: str | None = None,
+    flight_ref: str | None = None,
+    msg_type: str | None = None,
+    source_facility: str | None = None,
+    projection_type: str | None = None,
+    projection_key: str | None = None,
+    airport: str | None = None,
+    departure: str | None = None,
+    status: str | None = None,
+    status_any: str | None = None,
+    status_all: str | None = None,
+    status_field: str | None = None,
+    date: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    time_basis: str | None = None,
+) -> list[TfmsProjectionResponse]:
+    _validate_time_basis(time_basis)
+    start, end = _resolve_time_bounds(date=date, from_date=from_date, to_date=to_date, from_ts=from_ts, to_ts=to_ts)
+    if status_field and status_field not in TFMS_STATUS_FIELDS:
+        raise HTTPException(status_code=400, detail='invalid_status_field')
+
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    direction_desc = _resolve_sort(sort)
+
+    acid_values = _split_csv_values(acid or callsign, upper=True)
+    gufi_values = _split_csv_values(gufi)
+    flight_ref_values = _split_csv_values(flight_ref)
+    msg_type_values = _split_csv_values(msg_type)
+    source_values = _split_csv_values(source_facility, upper=True)
+    projection_type_values = _split_csv_values(projection_type, upper=True)
+    projection_key_values = _split_csv_values(projection_key)
+    airport_values = _split_csv_values(airport, upper=True)
+    departure_values = _split_csv_values(departure, upper=True)
+    status_any_values = {_normalize_status_value(v) for v in _split_csv_values(status_any or status)}
+    status_all_values = {_normalize_status_value(v) for v in _split_csv_values(status_all)}
+    any_targets = _status_targets('tfms', status_any_values)
+    all_targets = _status_targets('tfms', status_all_values)
+
     async with TfmsAsyncSessionLocal() as session:
-        rows = await get_tfms_projections(session, limit)
+        stmt = select(TfmsProjection)
+        if acid_values:
+            stmt = stmt.where(func.upper(TfmsProjection.acid).in_(acid_values))
+        if gufi_values:
+            stmt = stmt.where(TfmsProjection.gufi.in_(gufi_values))
+        if flight_ref_values:
+            stmt = stmt.where(TfmsProjection.flight_ref.in_(flight_ref_values))
+        if msg_type_values:
+            normalized_msg_types = {_normalize_msg_type(v) for v in msg_type_values}
+            normalized_msg_types.discard(None)
+            if normalized_msg_types:
+                stmt = stmt.where(
+                    func.lower(func.regexp_replace(func.coalesce(TfmsProjection.msg_type, ''), '[^A-Za-z0-9]', '', 'g')).in_(
+                        normalized_msg_types
+                    )
+                )
+        if source_values:
+            stmt = stmt.where(func.upper(TfmsProjection.source_facility).in_(source_values))
+        if projection_type_values:
+            stmt = stmt.where(func.upper(TfmsProjection.projection_type).in_(projection_type_values))
+        if projection_key_values:
+            stmt = stmt.where(TfmsProjection.projection_key.in_(projection_key_values))
+
+        stmt = stmt.order_by(
+            TfmsProjection.updated_at.desc() if direction_desc else TfmsProjection.updated_at.asc(),
+            TfmsProjection.projection_key.desc() if direction_desc else TfmsProjection.projection_key.asc(),
+        )
+        rows = list((await session.execute(stmt)).scalars())
+
+        filtered_rows: list[TfmsProjection] = []
+        for row in rows:
+            ts = _parse_iso_timestamp(row.source_timestamp)
+            if start is not None and (ts is None or ts < start):
+                continue
+            if end is not None and (ts is None or ts > end):
+                continue
+
+            data = row.data or {}
+            statuses = _tfms_status_values_from_projection_data(data)
+            fields = [status_field] if status_field else ['flight_status', 'tmi_status', 'service_state']
+            current_values = [statuses.get(field) for field in fields]
+            if any_targets and not _status_matches_any(current_values, any_targets):
+                continue
+            if all_targets and not _status_matches_all(current_values, all_targets):
+                continue
+
+            if airport_values or departure_values:
+                dep_airport, arr_airport = _extract_tfms_projection_airports(data)
+                if not _airport_matches(
+                    departure_airport=dep_airport,
+                    arrival_airport=arr_airport,
+                    departure_values=departure_values,
+                    airport_values=airport_values,
+                ):
+                    continue
+
+            filtered_rows.append(row)
+
+        rows = _paginate_list(filtered_rows, offset=offset, limit=limit)
+
         raw_by_key: dict[str, dict[str, Any]] = {}
         if raw and rows and settings.tfms_raw_response_from_xml:
             candidates = await session.execute(
@@ -1062,9 +1760,115 @@ async def get_tfms_projection(projection_key: str, raw: bool = False) -> TfmsPro
 
 
 @app.get('/tbfm/events', response_model=list[TbfmEventResponse])
-async def list_tbfm_events(limit: int = 100, raw: bool = False) -> list[TbfmEventResponse]:
+async def list_tbfm_events(
+    limit: int = 100,
+    offset: int = 0,
+    sort: str = 'desc',
+    raw: bool = False,
+    acid: str | None = None,
+    callsign: str | None = None,
+    gufi: str | None = None,
+    flight_ref: str | None = None,
+    msg_type: str | None = None,
+    source_facility: str | None = None,
+    tma_id: str | None = None,
+    queue_name: str | None = None,
+    status: str | None = None,
+    status_any: str | None = None,
+    status_all: str | None = None,
+    status_field: str | None = None,
+    airport: str | None = None,
+    departure: str | None = None,
+    date: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    time_basis: str | None = None,
+) -> list[TbfmEventResponse]:
+    _validate_time_basis(time_basis)
+    start, end = _resolve_time_bounds(date=date, from_date=from_date, to_date=to_date, from_ts=from_ts, to_ts=to_ts)
+    if status_field and status_field not in TBFM_STATUS_FIELDS:
+        raise HTTPException(status_code=400, detail='invalid_status_field')
+
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    direction_desc = _resolve_sort(sort)
+
+    acid_values = _split_csv_values(acid or callsign, upper=True)
+    gufi_values = _split_csv_values(gufi)
+    flight_ref_values = _split_csv_values(flight_ref)
+    msg_type_values = _split_csv_values(msg_type)
+    source_values = _split_csv_values(source_facility, upper=True)
+    tma_values = _split_csv_values(tma_id)
+    queue_values = _split_csv_values(queue_name)
+    airport_values = _split_csv_values(airport, upper=True)
+    departure_values = _split_csv_values(departure, upper=True)
+    status_any_values = {_normalize_status_value(v) for v in _split_csv_values(status_any or status)}
+    status_all_values = {_normalize_status_value(v) for v in _split_csv_values(status_all)}
+    any_targets = _status_targets('tbfm', status_any_values)
+    all_targets = _status_targets('tbfm', status_all_values)
+
     async with TbfmAsyncSessionLocal() as session:
-        rows = await get_tbfm_events(session, limit)
+        stmt = select(TbfmEvent)
+        if acid_values:
+            stmt = stmt.where(func.upper(TbfmEvent.acid).in_(acid_values))
+        if gufi_values:
+            stmt = stmt.where(TbfmEvent.gufi.in_(gufi_values))
+        if flight_ref_values:
+            stmt = stmt.where(TbfmEvent.flight_ref.in_(flight_ref_values))
+        if msg_type_values:
+            normalized_msg_types = {_normalize_msg_type(v) for v in msg_type_values}
+            normalized_msg_types.discard(None)
+            if normalized_msg_types:
+                stmt = stmt.where(
+                    func.lower(func.regexp_replace(func.coalesce(TbfmEvent.msg_type, ''), '[^A-Za-z0-9]', '', 'g')).in_(
+                        normalized_msg_types
+                    )
+                )
+        if source_values:
+            stmt = stmt.where(func.upper(TbfmEvent.source_facility).in_(source_values))
+        if tma_values:
+            stmt = stmt.where(TbfmEvent.tma_id.in_(tma_values))
+        if queue_values:
+            stmt = stmt.where(TbfmEvent.queue_name.in_(queue_values))
+        stmt = stmt.order_by(
+            TbfmEvent.created_at.desc() if direction_desc else TbfmEvent.created_at.asc(),
+            TbfmEvent.id.desc() if direction_desc else TbfmEvent.id.asc(),
+        )
+        rows = list((await session.execute(stmt)).scalars())
+
+    filtered_rows: list[TbfmEvent] = []
+    for row in rows:
+        ts = _parse_iso_timestamp(row.source_time)
+        if start is not None and (ts is None or ts < start):
+            continue
+        if end is not None and (ts is None or ts > end):
+            continue
+
+        payload = row.parsed_json or {}
+        statuses = _tbfm_status_values_from_payload(payload)
+        fields = [status_field] if status_field else ['acs', 'fps']
+        current_values = [statuses.get(field) for field in fields]
+        if any_targets and not _status_matches_any(current_values, any_targets):
+            continue
+        if all_targets and not _status_matches_all(current_values, all_targets):
+            continue
+
+        if airport_values or departure_values:
+            dep_airport, arr_airport = _tbfm_event_airports(payload)
+            if not _airport_matches(
+                departure_airport=dep_airport,
+                arrival_airport=arr_airport,
+                departure_values=departure_values,
+                airport_values=airport_values,
+            ):
+                continue
+
+        filtered_rows.append(row)
+
+    rows = _paginate_list(filtered_rows, offset=offset, limit=limit)
+
     return [
         TbfmEventResponse(
             id=row.id,
@@ -1094,9 +1898,120 @@ async def list_tbfm_events(limit: int = 100, raw: bool = False) -> list[TbfmEven
 
 
 @app.get('/tbfm/projections', response_model=list[TbfmProjectionResponse])
-async def list_tbfm_projections(limit: int = 100, raw: bool = False) -> list[TbfmProjectionResponse]:
+async def list_tbfm_projections(
+    limit: int = 100,
+    offset: int = 0,
+    sort: str = 'desc',
+    raw: bool = False,
+    acid: str | None = None,
+    callsign: str | None = None,
+    gufi: str | None = None,
+    tma_id: str | None = None,
+    flight_ref: str | None = None,
+    msg_type: str | None = None,
+    source_facility: str | None = None,
+    projection_type: str | None = None,
+    projection_key: str | None = None,
+    airport: str | None = None,
+    departure: str | None = None,
+    status: str | None = None,
+    status_any: str | None = None,
+    status_all: str | None = None,
+    status_field: str | None = None,
+    date: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    time_basis: str | None = None,
+) -> list[TbfmProjectionResponse]:
+    _validate_time_basis(time_basis)
+    start, end = _resolve_time_bounds(date=date, from_date=from_date, to_date=to_date, from_ts=from_ts, to_ts=to_ts)
+    if status_field and status_field not in TBFM_STATUS_FIELDS:
+        raise HTTPException(status_code=400, detail='invalid_status_field')
+
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    direction_desc = _resolve_sort(sort)
+
+    acid_values = _split_csv_values(acid or callsign, upper=True)
+    gufi_values = _split_csv_values(gufi)
+    tma_values = _split_csv_values(tma_id)
+    flight_ref_values = _split_csv_values(flight_ref)
+    msg_type_values = _split_csv_values(msg_type)
+    source_values = _split_csv_values(source_facility, upper=True)
+    projection_type_values = _split_csv_values(projection_type, upper=True)
+    projection_key_values = _split_csv_values(projection_key)
+    airport_values = _split_csv_values(airport, upper=True)
+    departure_values = _split_csv_values(departure, upper=True)
+    status_any_values = {_normalize_status_value(v) for v in _split_csv_values(status_any or status)}
+    status_all_values = {_normalize_status_value(v) for v in _split_csv_values(status_all)}
+    any_targets = _status_targets('tbfm', status_any_values)
+    all_targets = _status_targets('tbfm', status_all_values)
+
     async with TbfmAsyncSessionLocal() as session:
-        rows = await get_tbfm_projections(session, limit)
+        stmt = select(TbfmProjection)
+        if acid_values:
+            stmt = stmt.where(func.upper(TbfmProjection.acid).in_(acid_values))
+        if gufi_values:
+            stmt = stmt.where(TbfmProjection.gufi.in_(gufi_values))
+        if tma_values:
+            stmt = stmt.where(TbfmProjection.tma_id.in_(tma_values))
+        if flight_ref_values:
+            stmt = stmt.where(TbfmProjection.flight_ref.in_(flight_ref_values))
+        if msg_type_values:
+            normalized_msg_types = {_normalize_msg_type(v) for v in msg_type_values}
+            normalized_msg_types.discard(None)
+            if normalized_msg_types:
+                stmt = stmt.where(
+                    func.lower(func.regexp_replace(func.coalesce(TbfmProjection.msg_type, ''), '[^A-Za-z0-9]', '', 'g')).in_(
+                        normalized_msg_types
+                    )
+                )
+        if source_values:
+            stmt = stmt.where(func.upper(TbfmProjection.source_facility).in_(source_values))
+        if projection_type_values:
+            stmt = stmt.where(func.upper(TbfmProjection.projection_type).in_(projection_type_values))
+        if projection_key_values:
+            stmt = stmt.where(TbfmProjection.projection_key.in_(projection_key_values))
+
+        stmt = stmt.order_by(
+            TbfmProjection.updated_at.desc() if direction_desc else TbfmProjection.updated_at.asc(),
+            TbfmProjection.projection_key.desc() if direction_desc else TbfmProjection.projection_key.asc(),
+        )
+        rows = list((await session.execute(stmt)).scalars())
+
+        filtered_rows: list[TbfmProjection] = []
+        for row in rows:
+            ts = _parse_iso_timestamp(row.source_time)
+            if start is not None and (ts is None or ts < start):
+                continue
+            if end is not None and (ts is None or ts > end):
+                continue
+
+            data = row.data or {}
+            statuses = _tbfm_status_values_from_projection_data(data)
+            fields = [status_field] if status_field else ['acs', 'fps']
+            current_values = [statuses.get(field) for field in fields]
+            if any_targets and not _status_matches_any(current_values, any_targets):
+                continue
+            if all_targets and not _status_matches_all(current_values, all_targets):
+                continue
+
+            if airport_values or departure_values:
+                dep_airport, arr_airport = _extract_tbfm_projection_airports(data)
+                if not _airport_matches(
+                    departure_airport=dep_airport,
+                    arrival_airport=arr_airport,
+                    departure_values=departure_values,
+                    airport_values=airport_values,
+                ):
+                    continue
+
+            filtered_rows.append(row)
+
+        rows = _paginate_list(filtered_rows, offset=offset, limit=limit)
+
         raw_by_key: dict[str, dict[str, Any]] = {}
         if raw and rows and settings.tbfm_raw_response_from_xml:
             candidates = await session.execute(
@@ -1444,7 +2359,12 @@ async def tfms_websocket(websocket: WebSocket) -> None:
         await websocket.close(code=1011)
         return
 
-    snapshot = await _fetch_tfms_snapshot(subscription, limit=limit)
+    try:
+        snapshot = await _fetch_tfms_snapshot(subscription, limit=limit)
+    except HTTPException as exc:
+        await websocket.send_json({'type': 'error', 'error': exc.detail})
+        await websocket.close(code=1008)
+        return
     await websocket.send_json(
         {
             'type': 'snapshot',
@@ -1460,8 +2380,14 @@ async def tfms_websocket(websocket: WebSocket) -> None:
                 message = await asyncio.wait_for(websocket.receive_json(), timeout=0.2)
                 if isinstance(message, dict) and message.get('action') == 'subscribe':
                     subscription = _normalize_tfms_subscription(message)
+                    if isinstance(message.get('limit'), int) and message.get('limit') > 0:
+                        limit = max(1, min(int(message.get('limit')), 500))
                     if message.get('snapshot', True):
-                        snapshot = await _fetch_tfms_snapshot(subscription, limit=limit)
+                        try:
+                            snapshot = await _fetch_tfms_snapshot(subscription, limit=limit)
+                        except HTTPException as exc:
+                            await websocket.send_json({'type': 'error', 'error': exc.detail})
+                            continue
                         await websocket.send_json(
                             {
                                 'type': 'snapshot',
@@ -1514,11 +2440,15 @@ async def tfms_websocket(websocket: WebSocket) -> None:
 
                 if channel == settings.tfms_events_channel_name:
                     fields = _tfms_event_fields(obj)
-                    if _tfms_matches_subscription(fields, subscription):
+                    if _tfms_matches_subscription(fields, subscription) and _tfms_realtime_filters_match(
+                        obj, subscription, projection=False
+                    ):
                         await websocket.send_json({'type': 'event', 'subscription': subscription, 'event': obj})
                 elif channel == settings.tfms_projections_channel_name:
                     fields = _tfms_projection_fields(obj)
-                    if _tfms_matches_subscription(fields, subscription):
+                    if _tfms_matches_subscription(fields, subscription) and _tfms_realtime_filters_match(
+                        obj, subscription, projection=True
+                    ):
                         await websocket.send_json({'type': 'projection', 'subscription': subscription, 'projection': obj})
 
             if not drained:
@@ -1556,7 +2486,12 @@ async def tbfm_websocket(websocket: WebSocket) -> None:
         await websocket.close(code=1011)
         return
 
-    snapshot = await _fetch_tbfm_snapshot(subscription, limit=limit)
+    try:
+        snapshot = await _fetch_tbfm_snapshot(subscription, limit=limit)
+    except HTTPException as exc:
+        await websocket.send_json({'type': 'error', 'error': exc.detail})
+        await websocket.close(code=1008)
+        return
     await websocket.send_json(
         {
             'type': 'snapshot',
@@ -1572,8 +2507,14 @@ async def tbfm_websocket(websocket: WebSocket) -> None:
                 message = await asyncio.wait_for(websocket.receive_json(), timeout=0.2)
                 if isinstance(message, dict) and message.get('action') == 'subscribe':
                     subscription = _normalize_tbfm_subscription(message)
+                    if isinstance(message.get('limit'), int) and message.get('limit') > 0:
+                        limit = max(1, min(int(message.get('limit')), 500))
                     if message.get('snapshot', True):
-                        snapshot = await _fetch_tbfm_snapshot(subscription, limit=limit)
+                        try:
+                            snapshot = await _fetch_tbfm_snapshot(subscription, limit=limit)
+                        except HTTPException as exc:
+                            await websocket.send_json({'type': 'error', 'error': exc.detail})
+                            continue
                         await websocket.send_json(
                             {
                                 'type': 'snapshot',
@@ -1626,11 +2567,15 @@ async def tbfm_websocket(websocket: WebSocket) -> None:
 
                 if channel == settings.tbfm_events_channel_name:
                     fields = _tbfm_event_fields(obj)
-                    if _tbfm_matches_subscription(fields, subscription):
+                    if _tbfm_matches_subscription(fields, subscription) and _tbfm_realtime_filters_match(
+                        obj, subscription, projection=False
+                    ):
                         await websocket.send_json({'type': 'event', 'subscription': subscription, 'event': obj})
                 elif channel == settings.tbfm_projections_channel_name:
                     fields = _tbfm_projection_fields(obj)
-                    if _tbfm_matches_subscription(fields, subscription):
+                    if _tbfm_matches_subscription(fields, subscription) and _tbfm_realtime_filters_match(
+                        obj, subscription, projection=True
+                    ):
                         await websocket.send_json({'type': 'projection', 'subscription': subscription, 'projection': obj})
 
             if not drained:

@@ -10,6 +10,12 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d faa_swim"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
 
   redis-sfdps:
     image: redis:7
@@ -19,6 +25,11 @@ services:
     volumes:
       - redis_sfdps_data:/data
       - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   redis-tfms:
@@ -29,6 +40,11 @@ services:
     volumes:
       - redis_tfms_data:/data
       - ./docker/redis/redis-tfms.conf:/usr/local/etc/redis/redis-tfms.conf:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   redis-tbfm:
@@ -39,6 +55,11 @@ services:
     volumes:
       - redis_tbfm_data:/data
       - ./docker/redis/redis-tfms.conf:/usr/local/etc/redis/redis-tfms.conf:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   fastapi:
@@ -80,10 +101,14 @@ services:
       TBFM_CONSUMER_GROUP: ${TBFM_CONSUMER_GROUP:-tbfm-python-parser}
       TBFM_CONSUMER_NAME: ${TBFM_CONSUMER_NAME:-tbfm-worker-1}
     depends_on:
-      - postgres
-      - redis-sfdps
-      - redis-tfms
-      - redis-tbfm
+      postgres:
+        condition: service_healthy
+      redis-sfdps:
+        condition: service_healthy
+      redis-tfms:
+        condition: service_healthy
+      redis-tbfm:
+        condition: service_healthy
     ports:
       - '8000:8000'
     restart: unless-stopped
@@ -91,7 +116,7 @@ services:
   jms-bridge:
     image: maven:3.9-eclipse-temurin-17
     working_dir: /app
-    command: bash -lc "mvn -q -DskipTests package && java -jar target/faa-swim-jms-bridge-0.1.0.jar"
+    command: bash -lc "(mvn -q -DskipTests package || (rm -rf /root/.m2/repository && mvn -q -DskipTests package)) && java -jar target/faa-swim-jms-bridge-0.1.0.jar"
     volumes:
       - ./jms-bridge:/app
       - ./certs:/certs:ro
@@ -107,13 +132,14 @@ services:
       RAW_STREAM_MAXLEN: ${RAW_STREAM_MAXLEN:-200000}
       JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:-}
     depends_on:
-      - redis-sfdps
+      redis-sfdps:
+        condition: service_healthy
     restart: unless-stopped
 
   tfms-jms-bridge:
     image: maven:3.9-eclipse-temurin-17
     working_dir: /app
-    command: bash -lc "mvn -q -DskipTests package && java -jar target/tfms-jms-bridge-1.0.0-jar-with-dependencies.jar"
+    command: bash -lc "(mvn -q -DskipTests package || (rm -rf /root/.m2/repository && mvn -q -DskipTests package)) && java -jar target/tfms-jms-bridge-1.0.0-jar-with-dependencies.jar"
     volumes:
       - ./jms-bridge/tfms:/app
       - ./certs:/certs:ro
@@ -128,7 +154,8 @@ services:
       TFMS_RAW_STREAM_MAXLEN: ${TFMS_RAW_STREAM_MAXLEN:-200000}
       JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:-}
     depends_on:
-      - redis-tfms
+      redis-tfms:
+        condition: service_healthy
     restart: unless-stopped
 
   tbfm-jms-bridge:
@@ -137,7 +164,7 @@ services:
     command:
       - bash
       - -lc
-      - if [ -z "$$SOLACE_HOST" ]; then echo "TBFM bridge idle; set TBFM_SOLACE env vars"; sleep infinity; fi; rm -rf /root/.m2/repository && mvn -q -DskipTests package && java -jar target/tbfm-jms-bridge-1.0.0-jar-with-dependencies.jar
+      - if [ -z "$$SOLACE_HOST" ]; then echo "TBFM bridge idle; set TBFM_SOLACE env vars"; sleep infinity; fi; (mvn -q -DskipTests package || (rm -rf /root/.m2/repository && mvn -q -DskipTests package)) && java -jar target/tbfm-jms-bridge-1.0.0-jar-with-dependencies.jar
     volumes:
       - ./jms-bridge/tbfm:/app
       - ./certs:/certs:ro
@@ -152,7 +179,8 @@ services:
       TBFM_RAW_STREAM_MAXLEN: ${TBFM_RAW_STREAM_MAXLEN:-200000}
       JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:-}
     depends_on:
-      - redis-tbfm
+      redis-tbfm:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

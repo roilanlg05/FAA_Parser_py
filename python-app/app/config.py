@@ -67,6 +67,18 @@ class Settings:
         'yes',
         'on',
     }
+    sfdps_db_pool_size: int = int(os.getenv('SFDPS_DB_POOL_SIZE', '4'))
+    sfdps_db_max_overflow: int = int(os.getenv('SFDPS_DB_MAX_OVERFLOW', '4'))
+    sfdps_db_pool_timeout: int = int(os.getenv('SFDPS_DB_POOL_TIMEOUT', '30'))
+    sfdps_db_pool_recycle: int = int(os.getenv('SFDPS_DB_POOL_RECYCLE', '1800'))
+    tfms_db_pool_size: int = int(os.getenv('TFMS_DB_POOL_SIZE', '4'))
+    tfms_db_max_overflow: int = int(os.getenv('TFMS_DB_MAX_OVERFLOW', '4'))
+    tfms_db_pool_timeout: int = int(os.getenv('TFMS_DB_POOL_TIMEOUT', '30'))
+    tfms_db_pool_recycle: int = int(os.getenv('TFMS_DB_POOL_RECYCLE', '1800'))
+    tbfm_db_pool_size: int = int(os.getenv('TBFM_DB_POOL_SIZE', '4'))
+    tbfm_db_max_overflow: int = int(os.getenv('TBFM_DB_MAX_OVERFLOW', '4'))
+    tbfm_db_pool_timeout: int = int(os.getenv('TBFM_DB_POOL_TIMEOUT', '30'))
+    tbfm_db_pool_recycle: int = int(os.getenv('TBFM_DB_POOL_RECYCLE', '1800'))
 
 
 settings = Settings()

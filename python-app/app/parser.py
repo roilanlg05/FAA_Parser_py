@@ -1,11 +1,80 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple, Union
+from collections import Counter
+from typing import Any, Dict, List, Optional, Tuple, Union
 import xml.etree.ElementTree as ET
 
 
+def split_tag(tag: str) -> Tuple[Optional[str], str]:
+    if tag.startswith('{'):
+        ns, local = tag[1:].split('}', 1)
+        return ns, local
+    return None, tag
+
+
 def local_name(tag: str) -> str:
-    return tag.rsplit('}', 1)[1] if '}' in tag else tag
+    return split_tag(tag)[1]
+
+
+def strip_ns_dict(raw: Dict[str, str]) -> Dict[str, str]:
+    return {local_name(key): value for key, value in raw.items()}
+
+
+def is_nil_element(elem: Optional[ET.Element]) -> bool:
+    if elem is None:
+        return False
+    for key, value in elem.attrib.items():
+        if local_name(key) == 'nil' and value.lower() in {'true', '1'}:
+            return True
+    return False
+
+
+def coerce_scalar(value: Optional[str]) -> object:
+    if value is None:
+        return None
+    lowered = value.lower()
+    if lowered in {'true', 'false'}:
+        return lowered == 'true'
+    maybe_int = to_int(value)
+    if maybe_int is not None and str(maybe_int) == value:
+        return maybe_int
+    maybe_float = to_float(value)
+    if maybe_float is not None and any(ch in value for ch in {'.', 'e', 'E'}):
+        return maybe_float
+    return value
+
+
+def parse_xml_node(elem: Optional[ET.Element]) -> object:
+    if elem is None:
+        return None
+
+    attrs = strip_ns_dict(dict(elem.attrib))
+    text = text_of(elem)
+    groups: Dict[str, List[ET.Element]] = {}
+    for child_elem in list(elem):
+        groups.setdefault(local_name(child_elem.tag), []).append(child_elem)
+
+    if not groups:
+        value: object = None if is_nil_element(elem) else coerce_scalar(text)
+        if attrs:
+            return {
+                'attributes': attrs,
+                'value': value,
+            }
+        return value
+
+    out: Dict[str, object] = {}
+    if attrs:
+        out['attributes'] = attrs
+    if text is not None:
+        out['text'] = coerce_scalar(text)
+    if is_nil_element(elem):
+        out['nil'] = True
+
+    for name, elems in groups.items():
+        values = [parse_xml_node(child_elem) for child_elem in elems]
+        out[name] = values[0] if len(values) == 1 else values
+    return out
 
 
 def child(parent: Optional[ET.Element], name: str) -> Optional[ET.Element]:
@@ -251,6 +320,245 @@ def parse_sfdps_collection(root: ET.Element) -> Dict[str, object]:
     }
 
 
+def parse_fdps_properties(properties: Optional[ET.Element]) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    if properties is None:
+        return out
+    for elem in list(properties):
+        name = local_name(elem.tag)
+        if list(elem):
+            out[name] = parse_xml_node(elem)
+        elif is_nil_element(elem):
+            out[name] = None
+        else:
+            out[name] = coerce_scalar(text_of(elem))
+    return out
+
+
+def parse_fdps_msg_times(msg_times: Optional[ET.Element]) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    if msg_times is None:
+        return out
+    for elem in list(msg_times):
+        name = local_name(elem.tag)
+        if list(elem):
+            out[name] = parse_xml_node(elem)
+        elif is_nil_element(elem):
+            out[name] = None
+        else:
+            out[name] = coerce_scalar(text_of(elem))
+    return out
+
+
+def parse_fdps_status(status: Optional[ET.Element]) -> Optional[Dict[str, object]]:
+    if status is None:
+        return None
+
+    out: Dict[str, object] = {}
+    artcc_items: List[Dict[str, object]] = []
+
+    for elem in list(status):
+        name = local_name(elem.tag)
+        if name == 'artcc':
+            artcc_items.append(
+                {
+                    'center': text_of(elem),
+                    'state': strip_ns_dict(dict(elem.attrib)).get('state'),
+                }
+            )
+            continue
+
+        if list(elem):
+            out[name] = parse_xml_node(elem)
+        elif is_nil_element(elem):
+            out[name] = None
+        else:
+            out[name] = coerce_scalar(text_of(elem))
+
+    if artcc_items:
+        out['artcc'] = artcc_items
+        out['artcc_count'] = len(artcc_items)
+        state_counts = Counter((item.get('state') or 'unknown') for item in artcc_items)
+        out['artcc_state_counts'] = dict(state_counts)
+
+    return out
+
+
+def parse_fdps_hs(hs: Optional[ET.Element]) -> Optional[Dict[str, object]]:
+    if hs is None:
+        return None
+
+    out: Dict[str, object] = {}
+    for elem in list(hs):
+        name = local_name(elem.tag)
+        if list(elem):
+            out[name] = parse_xml_node(elem)
+        elif is_nil_element(elem):
+            out[name] = None
+        else:
+            out[name] = coerce_scalar(text_of(elem))
+    return out
+
+
+def parse_fdps_msg(root: ET.Element) -> Dict[str, object]:
+    properties = parse_fdps_properties(child(root, 'properties'))
+    message_type = properties.get('propMessageType')
+    status = parse_fdps_status(child(root, 'status'))
+    hs = parse_fdps_hs(child(root, 'HS'))
+    variant = 'status'
+    if isinstance(message_type, str) and message_type:
+        variant = message_type.lower()
+    elif hs is not None:
+        variant = 'hs'
+
+    known = {'properties', 'center', 'msgTimes', 'status', 'HS'}
+    extras: Dict[str, object] = {}
+    for elem in list(root):
+        name = local_name(elem.tag)
+        if name in known:
+            continue
+        extras.setdefault(name, [])
+        current = extras[name]
+        if isinstance(current, list):
+            current.append(parse_xml_node(elem))
+    for key, value in list(extras.items()):
+        if isinstance(value, list) and len(value) == 1:
+            extras[key] = value[0]
+
+    return {
+        'payload_type': 'sfdps_fdps_status',
+        'variant': variant,
+        'center': text_of(child(root, 'center')),
+        'properties': properties,
+        'message_type': message_type,
+        'data_type': properties.get('propDataType'),
+        'msg_times': parse_fdps_msg_times(child(root, 'msgTimes')),
+        'status': status,
+        'hs': hs,
+        'extras': extras,
+    }
+
+
+def _unique_values(values: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _texts_by_local_name(root: ET.Element, tag_name: str) -> List[str]:
+    values: List[str] = []
+    for elem in root.iter():
+        if local_name(elem.tag) != tag_name:
+            continue
+        value = text_of(elem)
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def parse_aixm_member(has_member: ET.Element) -> Dict[str, object]:
+    member_children = list(has_member)
+    if not member_children:
+        return {
+            'entity_type': None,
+            'entity': None,
+            'summary': {},
+        }
+
+    entity = member_children[0]
+    entity_type = local_name(entity.tag)
+    entity_attributes = strip_ns_dict(dict(entity.attrib))
+    summary: Dict[str, object] = {
+        'id': entity_attributes.get('id'),
+    }
+
+    interpretations = _texts_by_local_name(entity, 'interpretation')
+    if interpretations:
+        summary['interpretations'] = _unique_values(interpretations)
+
+    if entity_type == 'Airspace':
+        designators = _texts_by_local_name(entity, 'designator')
+        if designators:
+            summary['designators'] = _unique_values(designators)
+        fav_numbers = _texts_by_local_name(entity, 'FAVnumber')
+        if fav_numbers:
+            summary['fav_numbers'] = _unique_values(fav_numbers)
+
+    if entity_type == 'RouteSegment':
+        availability = _texts_by_local_name(entity, 'availability')
+        if availability:
+            summary['availability'] = _unique_values(availability)
+
+    extension_counts = Counter(
+        local_name(elem.tag)
+        for elem in entity.iter()
+        if local_name(elem.tag).endswith('Extension')
+    )
+    if extension_counts:
+        summary['extension_counts'] = dict(extension_counts)
+
+    return {
+        'entity_type': entity_type,
+        'entity': parse_xml_node(entity),
+        'summary': summary,
+    }
+
+
+def parse_aixm_basic_message(root: ET.Element) -> Dict[str, object]:
+    root_attrs = strip_ns_dict(dict(root.attrib))
+    members = [parse_aixm_member(member) for member in children(root, 'hasMember')]
+
+    member_type_counts = Counter(
+        str(member.get('entity_type'))
+        for member in members
+        if member.get('entity_type') is not None
+    )
+
+    extension_counts: Counter[str] = Counter()
+    for member in members:
+        summary = member.get('summary')
+        if not isinstance(summary, dict):
+            continue
+        nested = summary.get('extension_counts')
+        if not isinstance(nested, dict):
+            continue
+        for key, value in nested.items():
+            if isinstance(key, str) and isinstance(value, int):
+                extension_counts[key] += value
+
+    known = {'name', 'boundedBy', 'hasMember'}
+    extras: Dict[str, object] = {}
+    for elem in list(root):
+        name = local_name(elem.tag)
+        if name in known:
+            continue
+        extras.setdefault(name, [])
+        current = extras[name]
+        if isinstance(current, list):
+            current.append(parse_xml_node(elem))
+    for key, value in list(extras.items()):
+        if isinstance(value, list) and len(value) == 1:
+            extras[key] = value[0]
+
+    return {
+        'payload_type': 'sfdps_aixm_basic_message',
+        'id': root_attrs.get('id'),
+        'name': text_of(child(root, 'name')),
+        'attributes': root_attrs,
+        'bounded_by': parse_xml_node(child(root, 'boundedBy')),
+        'member_count': len(members),
+        'member_type_counts': dict(member_type_counts),
+        'extension_counts': dict(extension_counts),
+        'members': members,
+        'extras': extras,
+    }
+
+
 # --- ASDE-X ---
 
 def parse_flight_id(elem: Optional[ET.Element]) -> Optional[Dict[str, Optional[str]]]:
@@ -356,6 +664,10 @@ def detect_payload_type(root: ET.Element) -> str:
     name = local_name(root.tag)
     if name == 'MessageCollection':
         return 'sfdps_message_collection'
+    if name == 'FDPSMsg':
+        return 'sfdps_fdps_status'
+    if name == 'AIXMBasicMessage':
+        return 'sfdps_aixm_basic_message'
     if name == 'asdexMsg':
         return 'asdex_surface_movement_event'
     if name == 'record':
@@ -368,6 +680,10 @@ def parse_faa_xml(xml_text: Union[str, bytes]) -> Dict[str, object]:
     payload_type = detect_payload_type(root)
     if payload_type == 'sfdps_message_collection':
         return parse_sfdps_collection(root)
+    if payload_type == 'sfdps_fdps_status':
+        return parse_fdps_msg(root)
+    if payload_type == 'sfdps_aixm_basic_message':
+        return parse_aixm_basic_message(root)
     if payload_type == 'asdex_surface_movement_event':
         return parse_asdex(root)
     if payload_type == 'surveillance_track_record':

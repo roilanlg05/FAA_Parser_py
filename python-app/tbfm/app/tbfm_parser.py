@@ -7,6 +7,12 @@ from typing import Any, Optional
 TBFM_NS = 'urn:us:gov:dot:faa:atm:tfm:tbfmmeteringpublication'
 
 
+def is_supported_tbfm_namespace(ns: str | None) -> bool:
+    if ns is None:
+        return False
+    return ns == TBFM_NS or ns.startswith(f'{TBFM_NS}:')
+
+
 def split_tag(tag: str) -> tuple[str | None, str]:
     if tag.startswith('{'):
         ns, local = tag[1:].split('}', 1)
@@ -292,7 +298,31 @@ def parse_env(elem: ET.Element) -> dict[str, Any]:
     groups = indexed_children(elem)
     out = {
         'payload_type': 'tbfm_metering_publication',
+        'root_tag': 'env',
         'attributes': strip_ns_dict(dict(elem.attrib)),
+        'tma': [parse_tma(x) for x in groups.get('tma', [])],
+        'extras': {},
+        'raw': element_to_lossless_json(elem),
+    }
+    for name, elems in groups.items():
+        if name != 'tma':
+            out['extras'][name] = [element_to_lossless_json(x) for x in elems]
+    return out
+
+
+def parse_mis(elem: ET.Element) -> dict[str, Any]:
+    groups = indexed_children(elem)
+    attrs = strip_ns_dict(dict(elem.attrib))
+    normalized_attrs = dict(attrs)
+    if attrs.get('misSrce') and not normalized_attrs.get('envSrce'):
+        normalized_attrs['envSrce'] = attrs.get('misSrce')
+    if attrs.get('misTime') and not normalized_attrs.get('envTime'):
+        normalized_attrs['envTime'] = attrs.get('misTime')
+
+    out = {
+        'payload_type': 'tbfm_metering_publication',
+        'root_tag': 'mis',
+        'attributes': normalized_attrs,
         'tma': [parse_tma(x) for x in groups.get('tma', [])],
         'extras': {},
         'raw': element_to_lossless_json(elem),
@@ -306,9 +336,13 @@ def parse_env(elem: ET.Element) -> dict[str, Any]:
 def parse_tbfm_document(xml_text: str) -> dict[str, Any]:
     root = ET.fromstring(xml_text)
     ns, local = split_tag(root.tag)
-    if local != 'env' or ns != TBFM_NS:
+    if not is_supported_tbfm_namespace(ns):
         raise ValueError(f'Unsupported root for TBFM parser: {root.tag}')
-    return parse_env(root)
+    if local == 'env':
+        return parse_env(root)
+    if local == 'mis':
+        return parse_mis(root)
+    raise ValueError(f'Unsupported root for TBFM parser: {root.tag}')
 
 
 def parse_tbfm_text(text: str) -> dict[str, Any]:

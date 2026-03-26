@@ -42,21 +42,22 @@ async def ingest_tbfm_xml(
     metadata: dict[str, Any] | None,
 ) -> dict[str, Any]:
     parsed = parse_tbfm_xml(xml_text)
+    first_doc = ((parsed.get('documents') or [None])[0] or {}) if isinstance(parsed, dict) else {}
     source_facility, msg_type, flight_ref, acid, gufi, tma_id = _tbfm_summary(parsed)
     projections = build_tbfm_projections(parsed)
-    source_time = None
-    first_doc = ((parsed.get('documents') or [None])[0] or {}) if isinstance(parsed, dict) else {}
     env_attrs = (first_doc.get('attributes') or {}) if isinstance(first_doc, dict) else {}
     first_tma = ((first_doc.get('tma') or [None])[0] or {}) if isinstance(first_doc, dict) else {}
     tma_attrs = (first_tma.get('attributes') or {}) if isinstance(first_tma, dict) else {}
     source_time = tma_attrs.get('msgTime') or env_attrs.get('envTime')
+    payload_type = first_doc.get('payload_type') if isinstance(first_doc, dict) else None
+    root_tag = first_doc.get('root_tag') if isinstance(first_doc, dict) else None
 
     compact_parsed = strip_raw_fields(parsed)
 
     event = TbfmEvent(
         queue_name=queue_name or settings.tbfm_queue_name,
-        payload_type='tbfm_metering_publication',
-        root_tag='env',
+        payload_type=payload_type or 'tbfm_metering_publication',
+        root_tag=root_tag or 'env',
         source_facility=source_facility,
         msg_type=msg_type,
         flight_ref=flight_ref,

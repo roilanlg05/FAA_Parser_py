@@ -137,7 +137,7 @@ services:
     command:
       - bash
       - -lc
-      - if [ -z "$$SOLACE_HOST" ]; then echo "TBFM bridge idle; set TBFM_SOLACE env vars"; sleep infinity; fi; rm -rf /root/.m2/repository/com/google/code/gson/gson/2.11.0 && mvn -q -DskipTests package && java -jar target/tbfm-jms-bridge-1.0.0-jar-with-dependencies.jar
+      - if [ -z "$$SOLACE_HOST" ]; then echo "TBFM bridge idle; set TBFM_SOLACE env vars"; sleep infinity; fi; rm -rf /root/.m2/repository && mvn -q -DskipTests package && java -jar target/tbfm-jms-bridge-1.0.0-jar-with-dependencies.jar
     volumes:
       - ./jms-bridge/tbfm:/app
       - ./certs:/certs:ro
